@@ -1128,6 +1128,11 @@ module Sequel
         true
       end
 
+      # MySQL considers NULL values smaller than all other values.
+      def nulls_first_by_default?
+        true
+      end
+
       def select_only_offset_sql(sql)
         sql << " LIMIT "
         literal_append(sql, @opts[:offset])

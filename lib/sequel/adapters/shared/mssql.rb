@@ -1217,6 +1217,11 @@ module Sequel
         true
       end
 
+      # MSSQL considers NULL values smaller than all other values.
+      def nulls_first_by_default?
+        true
+      end
+
       # MSSQL supports 100-nsec precision for time columns, but ruby by
       # default only supports usec precision.
       def sqltime_precision

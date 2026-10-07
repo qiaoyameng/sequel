@@ -619,8 +619,28 @@ module Sequel
     #              be set to :filter, which uses a limit and a filter that excludes
     #              rows from previous pages.  In order for this strategy to work, you must be
     #              selecting the columns you are ordering by, and none of the columns can contain
-    #              NULLs.  Note that some Sequel adapters have optimized implementations that will
+    #              NULLs.  This can also be set to :keyset, which uses a similar approach to
+    #              :filter, but supports NULL values in the ordered expressions, supports
+    #              per-expression ASC/DESC and NULLS FIRST/LAST ordering, and supports
+    #              arbitrary ordering expressions by selecting them internally using
+    #              generated aliases (which are removed from the rows before yielding).
+    #              The :keyset strategy requires the :unique_key option, and unlike the
+    #              :filter strategy, it still applies when the dataset has an existing
+    #              limit, respecting the limit as a cap on the total number of rows yielded.
+    #              Note that some Sequel adapters have optimized implementations that will
     #              use cursors or streaming regardless of the :strategy option used.
+    # :unique_key :: Required if the strategy: :keyset option is used.  An expression or
+    #                array of expressions for the trailing key(s) that make the dataset's
+    #                total order unique (such as a primary key).  These are appended to
+    #                the dataset's order if not already present.  Because a stable
+    #                paging boundary cannot be promised without a unique total order,
+    #                paged_each raises an error if this option is not provided.
+    # :start_values :: If the strategy: :keyset option is used, this can be set to an
+    #                  array of values for the complete sort tuple (the dataset's order
+    #                  expressions followed by the :unique_key expressions) of a row,
+    #                  to resume paging immediately after that row.  This allows
+    #                  restarting a paged_each iteration from a boundary determined
+    #                  earlier.
     # :filter_values :: If the strategy: :filter option is used, this option should be a proc
     #                   that accepts the last retrieved row for the previous page and an array of
     #                   ORDER BY expressions, and returns an array of values relating to those
@@ -653,6 +673,23 @@ module Sequel
     #   # SELECT * FROM table ORDER BY id LIMIT 1000
     #   # SELECT * FROM table WHERE id > 1001 ORDER BY id LIMIT 1000
     #   # ...
+    #
+    #   DB[:table].order(Sequel.asc(:a, nulls: :last), Sequel.desc(:b)).paged_each(
+    #     strategy: :keyset, unique_key: :id){|row| }
+    #   # SELECT *, a AS __sequel_paged_each_keyset_0, b AS __sequel_paged_each_keyset_1,
+    #   #   id AS __sequel_paged_each_keyset_2 FROM table
+    #   #   ORDER BY a ASC NULLS LAST, b DESC, id LIMIT 1000
+    #   # SELECT *, ... FROM table
+    #   #   WHERE ((a > 1) OR (a IS NULL) OR ((a = 1) AND (b < 2)) OR
+    #   #     ((a = 1) AND (b = 2) AND ((id > 3) OR (id IS NULL))))
+    #   #   ORDER BY a ASC NULLS LAST, b DESC, id LIMIT 1000
+    #   # ...
+    #
+    # Note that with the :keyset strategy (as with the :filter strategy), the
+    # consistency guarantee provided by the transaction only applies to static
+    # data.  Concurrent modifications that change the sort key values of rows
+    # that have not been retrieved yet can cause rows to be skipped or yielded
+    # more than once, and are outside the scope of the guarantee.
     def paged_each(opts=OPTS)
       unless @opts[:order]
         raise Sequel::Error, "Dataset#paged_each requires the dataset be ordered"
@@ -669,10 +706,20 @@ module Sequel
       end
 
       rows_per_fetch = opts[:rows_per_fetch] || 1000
-      strategy = if offset || total_limit
+      strategy = if opts[:strategy] == :keyset
+        :keyset
+      elsif offset || total_limit
         :offset
       else
         opts[:strategy] || :offset
+      end
+
+      if strategy == :keyset
+        unique_key = opts[:unique_key]
+        if unique_key.nil? || (unique_key.respond_to?(:empty?) && unique_key.empty?)
+          raise Sequel::Error, "Dataset#paged_each with strategy: :keyset requires the :unique_key option, " \
+            "giving the trailing order key(s) that make the total order unique"
+        end
       end
 
       db.transaction(opts) do
@@ -687,6 +734,10 @@ module Sequel
               yield row
             end
             ds = (base_ds.where(ignore_values_preceding(last_row, &filter_values)) if last_row)
+          end
+        when :keyset
+          paged_each_keyset(rows_per_fetch, total_limit, offset, unique_key, opts[:start_values]) do |row|
+            yield row
           end
         else
           offset ||= 0
@@ -1341,6 +1392,144 @@ module Sequel
         Sequel.&(*expr)
       end
       Sequel.|(*cond)
+    end
+
+    # Implementation of Dataset#paged_each for the :keyset strategy.  Builds a
+    # total order from the dataset's order expressions plus the given unique
+    # key expressions, and filters each page to rows following the complete
+    # sort tuple of the last row of the previous page, respecting the
+    # ASC/DESC direction and NULLS FIRST/LAST ordering of each expression.
+    def paged_each_keyset(rows_per_fetch, total_limit, offset, unique_key, start_values)
+      specs = []
+      order_exprs = @opts[:order].map do |o|
+        if o.is_a?(SQL::OrderedExpression)
+          specs << [o.expression, o.descending, o.nulls]
+          o.expression
+        else
+          specs << [o, false, nil]
+          o
+        end
+      end
+
+      ds = self
+      Array(unique_key).each do |key|
+        unless order_exprs.any?{|o| o == key}
+          specs << [key, false, nil]
+          ds = ds.order_append(key)
+        end
+      end
+
+      # If an order expression is a simple identifier that matches an alias
+      # used in the SELECT list, use the aliased expression when selecting
+      # the generated helper columns and building boundary conditions, as
+      # most databases do not allow referencing SELECT aliases outside of
+      # ORDER BY.
+      if (select = @opts[:select]) && select.any?{|s| s.is_a?(SQL::AliasedExpression)}
+        select_aliases = {}
+        select.each do |s|
+          select_aliases[s.alias.to_sym] = s.expression if s.is_a?(SQL::AliasedExpression)
+        end
+        specs.map! do |expr, descending, nulls|
+          name = case expr
+          when Symbol
+            expr
+          when SQL::Identifier
+            expr.value.to_sym
+          end
+          if name && (aliased = select_aliases[name])
+            [aliased, descending, nulls]
+          else
+            [expr, descending, nulls]
+          end
+        end
+      end
+
+      # For order expressions without an explicit NULLS FIRST/NULLS LAST,
+      # use the database's default NULL ordering, so the boundary conditions
+      # match the actual ordering of the queries.
+      specs.map! do |expr, descending, nulls|
+        nulls ||= if nulls_first_by_default?
+          descending ? :last : :first
+        else
+          descending ? :first : :last
+        end
+        [expr, descending, nulls]
+      end
+
+      if start_values && start_values.length != specs.length
+        raise Sequel::Error, "Dataset#paged_each :start_values option must have one entry per sort expression (#{specs.length} expected, #{start_values.length} given)"
+      end
+
+      # Select each sort expression under a generated alias, so the boundary
+      # values can be retrieved from the returned rows even when the order
+      # expressions are not simple columns.  The generated columns are
+      # removed from each row before the row is yielded.
+      helper_columns = specs.each_index.map{|i| :"__sequel_paged_each_keyset_#{i}"}
+      ds = ds.select_append(*specs.each_with_index.map{|(expr, _, _), i| SQL::AliasedExpression.new(expr, helper_columns[i])})
+
+      total_rows = 0
+      boundary = start_values
+      first = true
+
+      loop do
+        rows = rows_per_fetch
+        if total_limit
+          remaining = total_limit - total_rows
+          break if remaining <= 0
+          rows = remaining if remaining < rows
+        end
+
+        page_ds = ds.limit(rows, first ? offset : nil)
+        page_ds = page_ds.where(keyset_boundary_condition(specs, boundary)) if boundary
+
+        boundary = nil
+        page_ds.each do |row|
+          boundary = helper_columns.map{|c| row[c]}
+          helper_columns.each{|c| row.delete(c)} if row.is_a?(Hash)
+          yield row
+          total_rows += 1
+        end
+
+        break unless boundary
+        first = false
+      end
+    end
+
+    # Returns an expression matching rows that sort strictly after the given
+    # boundary values, for the given sort specifications.  Each sort
+    # specification is an array of the expression, whether the expression is
+    # ordered descending, and the NULL ordering for the expression (:first or
+    # :last).  NULL boundary values are handled using IS NULL/IS NOT NULL,
+    # and each expression is compared according to its own direction.
+    def keyset_boundary_condition(specs, values)
+      prefix = []
+      conds = []
+
+      specs.zip(values) do |(expr, descending, nulls), value|
+        after = if value.nil?
+          # With NULLS FIRST, every non-NULL value sorts after a NULL
+          # boundary value.  With NULLS LAST, nothing sorts after NULL.
+          SQL::BooleanExpression.new(:'IS NOT', expr, nil) if nulls == :first
+        else
+          cmp = SQL::BooleanExpression.new(descending ? :< : :>, expr, value)
+          if nulls == :last
+            # NULL values sort after all non-NULL values.
+            SQL::BooleanExpression.new(:OR, cmp, SQL::BooleanExpression.new(:IS, expr, nil))
+          else
+            cmp
+          end
+        end
+
+        conds << (prefix.empty? ? after : SQL::BooleanExpression.new(:AND, *prefix, after)) if after
+
+        prefix << if value.nil?
+          SQL::BooleanExpression.new(:IS, expr, nil)
+        else
+          SQL::BooleanExpression.new(:'=', expr, value)
+        end
+      end
+
+      SQL::BooleanExpression.new(:OR, *conds)
     end
 
     # Downcase identifiers by default when outputting them from the database.

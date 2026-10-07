@@ -1015,6 +1015,11 @@ module Sequel
         db.sqlite_version < 33000
       end
 
+      # SQLite considers NULL values smaller than all other values.
+      def nulls_first_by_default?
+        true
+      end
+
       # SQLite does not support FOR UPDATE, but silently ignore it
       # instead of raising an error for compatibility with other
       # databases.

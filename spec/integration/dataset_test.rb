@@ -2418,3 +2418,85 @@ describe "MERGE" do
     @m1.all.must_equal []
   end
 end if DB.dataset.supports_merge? && DB.database_type != :oracle
+
+describe "Dataset#paged_each with :keyset strategy" do
+  before do
+    @db = DB
+    @db.create_table!(:keyset_items) do
+      primary_key :id
+      Integer :a
+      Integer :b
+    end
+    @ds = @db[:keyset_items]
+    [[nil, 1], [nil, nil], [1, 3], [1, nil], [1, 3],
+     [2, 2], [2, nil], [nil, nil], [1, 3], [2, 1]].each do |a, b|
+      @ds.insert(:a=>a, :b=>b)
+    end
+  end
+  after do
+    @db.drop_table?(:keyset_items)
+  end
+
+  it "should page through tied and NULL values, matching a single ORDER BY query" do
+    orders = [
+      [Sequel.asc(:a, :nulls=>:first), Sequel.desc(:b, :nulls=>:last)],
+      [Sequel.desc(:a, :nulls=>:last), Sequel.asc(:b, :nulls=>:first)],
+      [Sequel.asc(:a, :nulls=>:last), Sequel.desc(:b, :nulls=>:first)],
+      [Sequel.desc(:a, :nulls=>:first), Sequel.asc(:b, :nulls=>:last)],
+      [:a, Sequel.desc(:b)],
+      [Sequel.desc(:a), :b],
+    ]
+    orders.each do |order|
+      expected = @ds.order(*order).all
+      [1, 3, 4, 1000].each do |rows_per_fetch|
+        rows = []
+        @ds.order(*order).paged_each(:strategy=>:keyset, :unique_key=>:id, :rows_per_fetch=>rows_per_fetch){|row| rows << row}
+        rows.must_equal expected
+        rows.each{|row| row.keys.sort.must_equal [:a, :b, :id]}
+      end
+    end
+  end
+
+  it "should resume from a mid-iteration boundary with :start_values" do
+    order = [Sequel.asc(:a, :nulls=>:first), Sequel.desc(:b, :nulls=>:last)]
+    expected = @ds.order(*order).all
+    [0, 2, 5, 8, 9].each do |k|
+      boundary_row = expected[k]
+      rows = []
+      @ds.order(*order).paged_each(:strategy=>:keyset, :unique_key=>:id, :rows_per_fetch=>2,
+        :start_values=>[boundary_row[:a], boundary_row[:b], boundary_row[:id]]){|row| rows << row}
+      rows.must_equal expected[(k+1)..-1]
+    end
+  end
+
+  it "should respect an existing limit and filter" do
+    order = [:a, Sequel.desc(:b)]
+    expected = @ds.order(*order).limit(7).all
+    rows = []
+    @ds.order(*order).limit(7).paged_each(:strategy=>:keyset, :unique_key=>:id, :rows_per_fetch=>3){|row| rows << row}
+    rows.must_equal expected
+
+    ds = @ds.where(Sequel[:b] > 0).order(*order)
+    rows = []
+    ds.paged_each(:strategy=>:keyset, :unique_key=>:id, :rows_per_fetch=>2){|row| rows << row}
+    rows.must_equal ds.all
+  end
+
+  it "should support ordering by SELECT aliases and arbitrary expressions" do
+    ds = @ds.select(Sequel[:a].as(:x), Sequel[:b].as(:y), :id).
+      order(Sequel.asc(:x, :nulls=>:last), Sequel.desc(:y, :nulls=>:first))
+    rows = []
+    ds.paged_each(:strategy=>:keyset, :unique_key=>:id, :rows_per_fetch=>3){|row| rows << row}
+    rows.must_equal ds.all
+    rows.each{|row| row.keys.sort.must_equal [:id, :x, :y]}
+
+    ds = @ds.select((Sequel[:a] + Sequel[:b]).as(:s), :id).order(Sequel.asc(:s, :nulls=>:first))
+    rows = []
+    ds.paged_each(:strategy=>:keyset, :unique_key=>:id, :rows_per_fetch=>4){|row| rows << row}
+    rows.must_equal ds.all
+  end
+
+  it "should require the :unique_key option" do
+    proc{@ds.order(:a).paged_each(:strategy=>:keyset){|row| }}.must_raise Sequel::Error
+  end
+end

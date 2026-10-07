@@ -1,5 +1,7 @@
 === master
 
+* Add Dataset#paged_each :keyset strategy, supporting NULL values, per-expression ASC/DESC and NULLS FIRST/LAST, and SELECT aliases in the order, with a required :unique_key option and a :start_values option for resuming from a boundary
+
 * Make create_table with :temp and :as options create temporary table on Microsoft SQL Server and DB2 (jeremyevans) (#2393)
 
 * Revert support for PostgreSQL 19 property graphs (jeremyevans)

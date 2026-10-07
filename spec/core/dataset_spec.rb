@@ -6049,6 +6049,77 @@ describe "Dataset#paged_each" do
       "SELECT * FROM test WHERE ((z > 8) OR ((z = 8) AND ((test.y * 2) < 6)) OR ((z = 8) AND ((test.y * 2) = 6) AND (x > 8))) ORDER BY z, (test.y * 2) DESC, x ASC LIMIT 5"]
     @rows.must_equal db
   end
+
+  it "should support :strategy=>:keyset" do
+    db = (0...10).map{|i| {:x=>i, :id=>i+1}}
+    fetch = db.each_slice(5).map{|page| page.map{|h| h.merge(:__sequel_paged_each_keyset_0=>h[:x], :__sequel_paged_each_keyset_1=>h[:id])}}
+    @ds = Sequel.mock[:test].order(:x).with_fetch(fetch)
+    @ds.paged_each(:rows_per_fetch=>5, :strategy=>:keyset, :unique_key=>:id, &@proc)
+    @rows.must_equal db
+    @ds.db.sqls[1...-1].must_equal [
+      "SELECT *, x AS __sequel_paged_each_keyset_0, id AS __sequel_paged_each_keyset_1 FROM test ORDER BY x, id LIMIT 5",
+      "SELECT *, x AS __sequel_paged_each_keyset_0, id AS __sequel_paged_each_keyset_1 FROM test WHERE ((x > 4) OR (x IS NULL) OR ((x = 4) AND ((id > 5) OR (id IS NULL)))) ORDER BY x, id LIMIT 5",
+      "SELECT *, x AS __sequel_paged_each_keyset_0, id AS __sequel_paged_each_keyset_1 FROM test WHERE ((x > 9) OR (x IS NULL) OR ((x = 9) AND ((id > 10) OR (id IS NULL)))) ORDER BY x, id LIMIT 5"]
+  end
+
+  it "should not duplicate the unique key in the order with :strategy=>:keyset if already present" do
+    @ds = Sequel.mock[:test].order(:id).with_fetch([[]])
+    @ds.paged_each(:strategy=>:keyset, :unique_key=>:id, &@proc)
+    @ds.db.sqls[1...-1].must_equal ["SELECT *, id AS __sequel_paged_each_keyset_0 FROM test ORDER BY id LIMIT 1000"]
+  end
+
+  it "should require the :unique_key option with :strategy=>:keyset" do
+    lambda{@ds.paged_each(:strategy=>:keyset, &@proc)}.must_raise(Sequel::Error)
+    lambda{@ds.paged_each(:strategy=>:keyset, :unique_key=>[], &@proc)}.must_raise(Sequel::Error)
+  end
+
+  it "should support :strategy=>:keyset with NULLS FIRST/LAST and descending order" do
+    page = [
+      {:a=>1, :b=>5, :id=>1, :__sequel_paged_each_keyset_0=>1, :__sequel_paged_each_keyset_1=>5, :__sequel_paged_each_keyset_2=>1},
+      {:a=>nil, :b=>5, :id=>3, :__sequel_paged_each_keyset_0=>nil, :__sequel_paged_each_keyset_1=>5, :__sequel_paged_each_keyset_2=>3}]
+    @ds = Sequel.mock[:test].order(Sequel.asc(:a, nulls: :last), Sequel.desc(:b, nulls: :first)).with_fetch([page, []])
+    @ds.paged_each(:rows_per_fetch=>2, :strategy=>:keyset, :unique_key=>:id, &@proc)
+    @rows.must_equal [{:a=>1, :b=>5, :id=>1}, {:a=>nil, :b=>5, :id=>3}]
+    @ds.db.sqls[1...-1].must_equal [
+      "SELECT *, a AS __sequel_paged_each_keyset_0, b AS __sequel_paged_each_keyset_1, id AS __sequel_paged_each_keyset_2 FROM test ORDER BY a ASC NULLS LAST, b DESC NULLS FIRST, id LIMIT 2",
+      "SELECT *, a AS __sequel_paged_each_keyset_0, b AS __sequel_paged_each_keyset_1, id AS __sequel_paged_each_keyset_2 FROM test WHERE (((a IS NULL) AND (b < 5)) OR ((a IS NULL) AND (b = 5) AND ((id > 3) OR (id IS NULL)))) ORDER BY a ASC NULLS LAST, b DESC NULLS FIRST, id LIMIT 2"]
+  end
+
+  it "should respect an existing limit with :strategy=>:keyset" do
+    page1 = (0...3).map{|i| {:x=>i, :id=>i+1, :__sequel_paged_each_keyset_0=>i, :__sequel_paged_each_keyset_1=>i+1}}
+    page2 = (3...5).map{|i| {:x=>i, :id=>i+1, :__sequel_paged_each_keyset_0=>i, :__sequel_paged_each_keyset_1=>i+1}}
+    @ds = Sequel.mock[:test].order(:x).limit(5).with_fetch([page1, page2])
+    @ds.paged_each(:rows_per_fetch=>3, :strategy=>:keyset, :unique_key=>:id, &@proc)
+    @rows.must_equal (0...5).map{|i| {:x=>i, :id=>i+1}}
+    @ds.db.sqls[1...-1].must_equal [
+      "SELECT *, x AS __sequel_paged_each_keyset_0, id AS __sequel_paged_each_keyset_1 FROM test ORDER BY x, id LIMIT 3",
+      "SELECT *, x AS __sequel_paged_each_keyset_0, id AS __sequel_paged_each_keyset_1 FROM test WHERE ((x > 2) OR (x IS NULL) OR ((x = 2) AND ((id > 3) OR (id IS NULL)))) ORDER BY x, id LIMIT 2"]
+  end
+
+  it "should support the :start_values option with :strategy=>:keyset to resume from a boundary" do
+    @ds = Sequel.mock[:test].order(Sequel.desc(:a, nulls: :first)).with_fetch([[]])
+    @ds.paged_each(:strategy=>:keyset, :unique_key=>:id, :start_values=>[nil, 9], &@proc)
+    @ds.db.sqls[1...-1].must_equal [
+      "SELECT *, a AS __sequel_paged_each_keyset_0, id AS __sequel_paged_each_keyset_1 FROM test WHERE ((a IS NOT NULL) OR ((a IS NULL) AND ((id > 9) OR (id IS NULL)))) ORDER BY a DESC NULLS FIRST, id LIMIT 1000"]
+  end
+
+  it "should raise an error if :start_values has the wrong length with :strategy=>:keyset" do
+    lambda{@ds.paged_each(:strategy=>:keyset, :unique_key=>:id, :start_values=>[1], &@proc)}.must_raise(Sequel::Error)
+  end
+
+  it "should preserve an existing filter with :strategy=>:keyset" do
+    @ds = Sequel.mock[:test].where(:y=>1).order(:x).with_fetch([[]])
+    @ds.paged_each(:strategy=>:keyset, :unique_key=>:id, &@proc)
+    @ds.db.sqls[1...-1].must_equal [
+      "SELECT *, x AS __sequel_paged_each_keyset_0, id AS __sequel_paged_each_keyset_1 FROM test WHERE (y = 1) ORDER BY x, id LIMIT 1000"]
+  end
+
+  it "should support ordering by SELECT aliases with :strategy=>:keyset" do
+    @ds = Sequel.mock[:test].select(Sequel[:a].as(:x), :id).order(Sequel.asc(:x, nulls: :last)).with_fetch([[]])
+    @ds.paged_each(:strategy=>:keyset, :unique_key=>:id, &@proc)
+    @ds.db.sqls[1...-1].must_equal [
+      "SELECT a AS x, id, a AS __sequel_paged_each_keyset_0, id AS __sequel_paged_each_keyset_1 FROM test ORDER BY x ASC NULLS LAST, id LIMIT 1000"]
+  end
 end
 
 describe "Dataset#current_datetime" do

@@ -254,6 +254,17 @@ module Sequel
       false
     end
 
+    # Whether NULL values sort before all other values by default when
+    # ordering, i.e. whether ascending order treats NULL values as smaller
+    # than all other values.  This is used by Dataset#paged_each with
+    # strategy: :keyset to build boundary conditions for order expressions
+    # that do not explicitly use NULLS FIRST/NULLS LAST.  The default is
+    # false (NULL values sort last when ascending), which is correct for
+    # PostgreSQL, Oracle, and DB2, among others.
+    def nulls_first_by_default?
+      false
+    end
+
     # Whether common table expressions are supported in UNION/INTERSECT/EXCEPT clauses.
     def supports_cte_in_compounds?
       supports_cte_in_subqueries?
