@@ -3730,6 +3730,39 @@ describe "Dataset#import" do
   end
 end
 
+describe "Dataset#heterogeneous_insert" do
+  before do
+    @db = Sequel.mock
+    @ds = @db[:items]
+  end
+
+  it "should be available on datasets without loading the extension" do
+    @ds.respond_to?(:heterogeneous_insert).must_equal true
+    @ds.respond_to?(:heterogeneous_import).must_equal true
+  end
+
+  it "should distinguish missing columns from explicit nil and handle empty hashes" do
+    @ds.heterogeneous_insert([{:a=>1}, {:a=>nil, :b=>2}, {:b=>3}, {}])
+    @db.sqls.must_equal ['BEGIN',
+      "INSERT INTO items (a) VALUES (1)",
+      "INSERT INTO items (a, b) VALUES (NULL, 2)",
+      "INSERT INTO items (b) VALUES (3)",
+      "INSERT INTO items DEFAULT VALUES",
+      'COMMIT']
+  end
+
+  it "should only merge adjacent rows sharing the same column set" do
+    @ds = @ds.with_extend{def multi_insert_sql_strategy; :values end}
+    @ds.heterogeneous_insert([{:a=>1}, {:a=>2, :b=>3}, {:b=>4}, {:a=>5}])
+    @db.sqls.must_equal ['BEGIN',
+      "INSERT INTO items (a) VALUES (1)",
+      "INSERT INTO items (a, b) VALUES (2, 3)",
+      "INSERT INTO items (b) VALUES (4)",
+      "INSERT INTO items (a) VALUES (5)",
+      'COMMIT']
+  end
+end
+
 describe "Dataset#multi_insert" do
   before do
     @db = Sequel.mock(:servers=>{:s1=>{}})

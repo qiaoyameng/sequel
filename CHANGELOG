@@ -1,5 +1,7 @@
 === master
 
+* Add heterogeneous_insert extension for streaming import of hashes with different sets of keys, using database defaults for missing columns, NULL for explicit nil, adjacent-only batch combination, bounded memory use, and transactional rollback (GSB)
+
 * Make create_table with :temp and :as options create temporary table on Microsoft SQL Server and DB2 (jeremyevans) (#2393)
 
 * Revert support for PostgreSQL 19 property graphs (jeremyevans)

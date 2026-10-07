@@ -1222,6 +1222,127 @@ describe "Sequel::Dataset#import and #multi_insert" do
   end
 end
 
+describe "Sequel::Dataset#heterogeneous_insert" do
+  before(:all) do
+    @db = DB
+    Sequel.extension :heterogeneous_insert
+    @db.extension :heterogeneous_insert
+    @db.create_table!(:het) do
+      primary_key :id
+      Integer :a
+      Integer :b, :default=>100
+      Integer :c, :default=>7
+    end
+    @ds = @db[:het]
+  end
+  before do
+    @ds.delete
+  end
+  after(:all) do
+    @db.drop_table?(:het)
+    @db.drop_table?(:het_log)
+  end
+
+  it "should use database defaults for missing columns and NULL for explicit nil" do
+    @ds.heterogeneous_insert([
+      {:a=>1},
+      {:a=>2, :b=>20},
+      {:a=>3, :b=>nil},
+      {:b=>40},
+      {},
+      {:a=>6, :b=>60, :c=>600},
+    ])
+    @ds.order(:id).map([:a, :b, :c]).must_equal [
+      [1, 100, 7],
+      [2, 20, 7],
+      [3, nil, 7],
+      [nil, 40, 7],
+      [nil, 100, 7],
+      [6, 60, 600],
+    ]
+  end
+
+  it "should insert an empty hash using all database defaults" do
+    @ds.heterogeneous_insert([{}])
+    @ds.map([:a, :b, :c]).must_equal [[nil, 100, 7]]
+  end
+
+  it "should return nil" do
+    @ds.heterogeneous_insert([{:a=>1}]).must_be_nil
+  end
+
+  it "should accept a lazy Enumerator with bounded memory use" do
+    enum = Enumerator.new{|y| 1200.times{|i| y << {:a=>i, :c=>i}}}
+    @ds.heterogeneous_insert(enum)
+    @ds.count.must_equal 1200
+    @ds.where(:a=>0).map([:b, :c]).must_equal [[100, 0]]
+  end
+
+  it "should slice large runs of identical column sets" do
+    enum = Enumerator.new{|y| 1200.times{|i| y << {:a=>i}}}
+    @ds.heterogeneous_insert(enum, :commit_every=>123)
+    @ds.count.must_equal 1200
+  end
+
+  it "should slice according to the :max_parameters option" do
+    @ds.heterogeneous_insert([{:a=>1, :b=>1}, {:a=>2, :b=>2}, {:a=>3, :b=>3}],
+      :max_parameters=>4)
+    @ds.order(:id).map(:a).must_equal [1, 2, 3]
+  end
+
+  it "should raise with the row position when a single row exceeds :max_parameters" do
+    e = proc do
+      @ds.heterogeneous_insert([{:a=>1}, {:a=>2, :b=>3, :c=>4}], :max_parameters=>2)
+    end.must_raise(Sequel::InvalidValue)
+    e.message.must_include "position 1"
+    @ds.count.must_equal 0
+  end
+
+  it "should roll back earlier inserts when a later batch violates a constraint" do
+    @db.create_table!(:het_uc){Integer :a, :unique=>true}
+    begin
+      @db[:het_uc].heterogeneous_insert([{:a=>1}, {:a=>2}, {:a=>1}])
+    rescue Sequel::ConstraintViolation
+    end
+    @db[:het_uc].count.must_equal 0
+  end
+
+  it "should roll back if the enumerator raises mid-way" do
+    enum = Enumerator.new do |y|
+      3.times{|i| y << {:a=>i}}
+      raise "boom mid enum"
+    end
+    proc{@ds.heterogeneous_insert(enum)}.must_raise(RuntimeError)
+    @ds.count.must_equal 0
+  end
+
+  cspecify "should keep trigger-visible order when column sets change", :postgres, :mysql, :mssql, :oracle, :db2, [:jdbc] do
+    @db.create_table!(:het_log){Integer :n; Integer :a; Integer :b; Integer :c}
+    @db.run <<~SQL
+      CREATE TRIGGER het_after_insert AFTER INSERT ON het
+      FOR EACH ROW
+      BEGIN
+        INSERT INTO het_log (n, a, b, c)
+        SELECT COALESCE(MAX(n), 0) + 1, NEW.a, NEW.b, NEW.c FROM het_log;
+      END;
+    SQL
+    @ds.heterogeneous_insert([
+      {:a=>1},
+      {:a=>2, :b=>20},
+      {:b=>40},
+      {:a=>4},
+      {:a=>5, :b=>50},
+    ])
+    @db[:het_log].order(:n).map([:n, :a, :b, :c]).must_equal [
+      [1, 1, 100, 7],
+      [2, 2, 20, 7],
+      [3, nil, 40, 7],
+      [4, 4, 100, 7],
+      [5, 5, 50, 7],
+    ]
+  end
+end
+
 describe "Sequel::Dataset#import and #multi_insert :return=>:primary_key" do
   before do
     @db = DB
