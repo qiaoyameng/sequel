@@ -123,4 +123,118 @@ describe "AssociationDependencies plugin" do
     c2.load(:id=>1, :name=>'Al', :artist_id=>2).destroy
     DB.sqls.must_equal ['DELETE FROM albums WHERE id = 1', 'SELECT * FROM artists WHERE (artists.id = 2) LIMIT 1', 'DELETE FROM artists WHERE id = 2']
   end
+
+  it "should accept :restrict as a dependence action" do
+    @Album.add_association_dependencies :artist=>:restrict
+    @Album.association_dependencies[:after_restrict].must_equal [:artist]
+    @Artist.add_association_dependencies :albums=>:restrict, :first_album=>:restrict, :other_artists=>:restrict
+    @Artist.association_dependencies[:before_restrict].must_equal [:albums, :first_album, :other_artists]
+  end
+
+  it "should not issue any extra queries for models whose destroy graph has no restrict dependencies" do
+    @Album.add_association_dependencies :artist=>:destroy
+    @Album.load(:id=>1, :name=>'Al', :artist_id=>2).destroy
+    DB.sqls.must_equal ['DELETE FROM albums WHERE id = 1', 'SELECT * FROM artists WHERE (artists.id = 2) LIMIT 1', 'DELETE FROM artists WHERE id = 2']
+  end
+
+  it "should raise AssociationDependencyRestriction before any delete when a before restrict association has rows" do
+    @Artist.add_association_dependencies :albums=>:restrict
+    proc{@Artist.load(:id=>2, :name=>'Ar').destroy}.must_raise Sequel::AssociationDependencyRestriction
+    DB.sqls.must_equal ['SELECT id FROM albums WHERE (albums.artist_id = 2) LIMIT 3']
+  end
+
+  it "should raise AssociationDependencyRestriction for a one_to_one association with an associated object" do
+    @Artist.add_association_dependencies :first_album=>:restrict
+    begin
+      @Artist.load(:id=>2, :name=>'Ar').destroy
+    rescue Sequel::AssociationDependencyRestriction => e
+      e.root_object.must_equal @Artist.load(:id=>2, :name=>'Ar')
+      e.association_path.must_equal 'first_album'
+      e.example_keys.must_equal [{:id=>1}]
+      e.message.must_include 'cannot destroy'
+      e.message.must_include 'first_album'
+    else
+      raise "expected restriction"
+    end
+    DB.sqls.must_equal ['SELECT id FROM albums WHERE ((position = 1) AND (albums.artist_id = 2)) LIMIT 3']
+  end
+
+  it "should raise AssociationDependencyRestriction for a many_to_one association with an associated object" do
+    @Album.add_association_dependencies :artist=>:restrict
+    begin
+      @Album.load(:id=>1, :name=>'Al', :artist_id=>2).destroy
+    rescue Sequel::AssociationDependencyRestriction => e
+      e.association_path.must_equal 'artist'
+      e.example_keys.must_equal [{:id=>2}]
+    else
+      raise "expected restriction"
+    end
+    DB.sqls.must_equal ['SELECT id FROM artists WHERE (artists.id = 2) LIMIT 3']
+  end
+
+  it "should raise AssociationDependencyRestriction for a many_to_many association with related rows" do
+    @Artist.add_association_dependencies :other_artists=>:restrict
+    proc{@Artist.load(:id=>2, :name=>'Ar').destroy}.must_raise Sequel::AssociationDependencyRestriction
+    DB.sqls.must_equal ['SELECT id FROM artists INNER JOIN aoa ON (aoa.r = artists.id) WHERE (aoa.l = 2) LIMIT 3']
+  end
+
+  it "should allow destroying when a restrict association has no associated rows" do
+    @EmptyAlbum = Class.new(@c).set_dataset(:empty_albums)
+    @EmptyAlbum.dataset = @EmptyAlbum.dataset.with_fetch([])
+    @EmptyAlbum.columns :id, :name, :artist_id
+    @Artist.one_to_many :empty_albums, :class=>@EmptyAlbum, :key=>:artist_id
+    @Artist.add_association_dependencies :empty_albums=>:restrict
+    @Artist.load(:id=>2, :name=>'Ar').destroy
+    DB.sqls.must_equal ['SELECT id FROM empty_albums WHERE (empty_albums.artist_id = 2) LIMIT 3', 'DELETE FROM artists WHERE id = 2']
+  end
+
+  it "should check restrict dependencies reached through a destroy dependency graph" do
+    # Artist destroys albums; Album restricts tags (not a known association here,
+    # set it up through a third model)
+    @Tag = Class.new(@c).set_dataset(:tags)
+    @Tag.dataset = @Tag.dataset.with_fetch(:id=>9, :album_id=>1)
+    @Tag.columns :id, :album_id
+    @Album.one_to_many :tags, :class=>@Tag, :key=>:album_id
+    @Album.add_association_dependencies :tags=>:restrict
+    @Artist.add_association_dependencies :albums=>:destroy
+    begin
+      @Artist.load(:id=>2, :name=>'Ar').destroy
+    rescue Sequel::AssociationDependencyRestriction => e
+      e.association_path.must_equal 'albums -> tags'
+      e.example_keys.must_equal [{:id=>9}]
+    else
+      raise "expected restriction"
+    end
+    DB.sqls.must_equal [
+      'SELECT * FROM albums WHERE (albums.artist_id = 2)',
+      'SELECT id FROM tags WHERE (tags.album_id = 1) LIMIT 3'
+    ]
+  end
+
+  it "should not walk graphs reachable only through delete or nullify dependencies" do
+    @Tag = Class.new(@c).set_dataset(:tags)
+    @Tag.columns :id, :album_id
+    @Album.one_to_many :tags, :class=>@Tag, :key=>:album_id
+    @Album.add_association_dependencies :tags=>:restrict
+    @Artist.add_association_dependencies :albums=>:delete
+    @Artist.restriction_graph?.must_equal false
+    @Artist.load(:id=>2, :name=>'Ar').destroy
+    DB.sqls.must_equal ['DELETE FROM albums WHERE (albums.artist_id = 2)', 'DELETE FROM artists WHERE id = 2']
+  end
+
+  it "should not invoke before_destroy hooks or writes of other branches when one branch blocks" do
+    @Tag = Class.new(@c).set_dataset(:tags)
+    @Tag.dataset = @Tag.dataset.with_fetch(:id=>9, :album_id=>1)
+    @Tag.columns :id, :album_id
+    @Album.one_to_many :tags, :class=>@Tag, :key=>:album_id
+    @Album.add_association_dependencies :tags=>:restrict
+    @Artist.add_association_dependencies :albums=>:destroy
+    @Artist.one_to_one :second_album, :class=>@Album, :key=>:artist_id, :conditions=>{:position=>2}
+    @Artist.add_association_dependencies :second_album=>:delete
+    called = []
+    @Artist.define_method(:before_destroy){ called << :before_destroy; super }
+    proc{@Artist.load(:id=>2, :name=>'Ar').destroy}.must_raise Sequel::AssociationDependencyRestriction
+    called.must_equal []
+    DB.sqls.wont_include 'DELETE FROM albums WHERE ((position = 2) AND (albums.artist_id = 2))'
+  end
 end

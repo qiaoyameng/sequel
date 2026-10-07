@@ -3554,3 +3554,160 @@ describe "validate_associated_context plugin" do
     @db[:vac_artists].count.must_equal 1
   end
 end
+
+describe "AssociationDependencies plugin :restrict action" do
+  before do
+    @db = DB
+    @db.create_table!(:rad_artists){primary_key :id; String :name}
+    @db.create_table!(:rad_albums){primary_key :id; Integer :artist_id; Integer :producer_id; String :name}
+    @db.create_table!(:rad_tracks){primary_key :id; Integer :album_id; String :name}
+    @db.create_table!(:rad_comps){Integer :a; Integer :b; Integer :r1; Integer :r2; primary_key [:a, :b]}
+    @db.create_table!(:rad_guards){Integer :g1; Integer :g2; Integer :a; Integer :b; primary_key [:g1, :g2]}
+    @db.create_table!(:rad_mtm_join){Integer :artist_id; Integer :other_id}
+    @db[:rad_mtm_join].delete
+    @db[:rad_guards].delete
+    @db[:rad_comps].delete
+    @db[:rad_tracks].delete
+    @db[:rad_albums].delete
+    @db[:rad_artists].delete
+
+    @Artist = Class.new(Sequel::Model(@db[:rad_artists]))
+    @Album  = Class.new(Sequel::Model(@db[:rad_albums]))
+    @Track  = Class.new(Sequel::Model(@db[:rad_tracks]))
+    @Comp   = Class.new(Sequel::Model(@db[:rad_comps]))
+    @Guard  = Class.new(Sequel::Model(@db[:rad_guards]))
+
+    [@Artist, @Album, @Track].each{|c| c.plugin :association_dependencies}
+    @Comp.plugin :association_dependencies
+    @Comp.set_primary_key [:a, :b]
+    @Comp.unrestrict_primary_key
+    @Guard.set_primary_key [:g1, :g2]
+    @Guard.unrestrict_primary_key
+
+    @Album.one_to_many :tracks, :class=>@Track, :key=>:album_id
+    @Album.many_to_one :artist, :class=>@Artist
+    @Album.many_to_one :producer, :class=>@Artist, :key=>:producer_id
+    @Track.many_to_one :album, :class=>@Album
+    @Artist.one_to_many :albums, :class=>@Album, :key=>:artist_id
+    @Artist.one_to_many :produced_albums, :class=>@Album, :key=>:producer_id
+    @Artist.one_to_one :first_album, :class=>@Album, :key=>:artist_id, :conditions=>{:name=>'first'}
+    @Artist.many_to_many :peer_artists, :class=>@Artist, :join_table=>:rad_mtm_join,
+      :left_key=>:artist_id, :right_key=>:other_id
+    @Comp.one_to_many :guards, :class=>@Guard, :key=>[:a, :b], :primary_key=>[:a, :b]
+    @Artist.one_to_many :comp_c1, :class=>@Comp, :key=>:r1
+    @Artist.one_to_many :comp_c2, :class=>@Comp, :key=>:r2
+
+    @Artist.add_association_dependencies :albums=>:destroy, :produced_albums=>:destroy,
+      :comp_c1=>:destroy, :comp_c2=>:destroy,
+      :first_album=>:restrict, :peer_artists=>:restrict
+    @Album.add_association_dependencies :tracks=>:restrict
+    @Comp.add_association_dependencies :guards=>:restrict
+  end
+  after do
+    @db.drop_table?(:rad_mtm_join, :rad_guards, :rad_comps, :rad_tracks, :rad_albums, :rad_artists)
+  end
+
+  it "blocks before any write or hook and reports root, path, and example keys" do
+    artist = @Artist.create(:name=>'Ar')
+    album = @Album.create(:artist_id=>artist.id, :name=>'Al')
+    @Track.create(:album_id=>album.id, :name=>'Tr')
+    hooks = []
+    [@Artist, @Album, @Track].each do |c|
+      c.send(:define_method, :before_destroy){ hooks << c; super() }
+    end
+
+    error = proc{artist.destroy}.must_raise Sequel::AssociationDependencyRestriction
+    hooks.must_equal []
+    error.root_object.must_be_kind_of @Artist
+    error.root_object.pk.must_equal artist.pk
+    error.association_path.must_equal 'albums -> tracks'
+    error.example_keys.must_equal [{:id=>@Track.first.id}]
+    error.message.must_include 'albums -> tracks'
+    @db[:rad_artists].count.must_equal 1
+    @db[:rad_albums].count.must_equal 1
+    @db[:rad_tracks].count.must_equal 1
+  end
+
+  it "checks every branch first, so a blocked second branch never leaves the first branch half-deleted" do
+    artist = @Artist.create
+    ok_album = @Album.create(:artist_id=>artist.id, :name=>'ok')
+    bad_album = @Album.create(:artist_id=>artist.id, :name=>'bad')
+    @Track.create(:album_id=>bad_album.id)
+    proc{artist.destroy}.must_raise Sequel::AssociationDependencyRestriction
+    @db[:rad_albums].where(:id=>ok_album.id).count.must_equal 1
+    @db[:rad_albums].count.must_equal 2
+    @db[:rad_tracks].count.must_equal 1
+  end
+
+  it "destroys the full graph once all restrict associations are empty" do
+    artist = @Artist.create(:name=>'Ar')
+    album = @Album.create(:artist_id=>artist.id, :name=>'Al')
+    artist.destroy
+    @db[:rad_artists].count.must_equal 0
+    @db[:rad_albums].count.must_equal 0
+    @db[:rad_tracks].count.must_equal 0
+  end
+
+  it "restricts many_to_one and many_to_many associations" do
+    artist = @Artist.create
+    album = @Album.create(:artist_id=>artist.id)
+    @Album.add_association_dependencies :artist=>:restrict
+    proc{album.destroy}.must_raise Sequel::AssociationDependencyRestriction
+    @db[:rad_albums].count.must_equal 1
+
+    other = @Artist.create
+    @db[:rad_mtm_join].insert(:artist_id=>artist.id, :other_id=>other.id)
+    proc{artist.destroy}.must_raise Sequel::AssociationDependencyRestriction
+    @db[:rad_artists].count.must_equal 2
+    @db[:rad_mtm_join].count.must_equal 1
+  end
+
+  it "identifies shared composite-key subobjects with the full primary key, deduping within one graph walk" do
+    artist = @Artist.create
+    @Comp.create(:a=>1, :b=>2, :r1=>artist.id, :r2=>artist.id)
+    @Guard.create(:g1=>7, :g2=>8, :a=>1, :b=>2)
+    queries = []
+    @db.define_singleton_method(:log_connection_yield) do |sql, *a, **k, &b|
+      queries << sql
+      super(sql, *a, **k, &b)
+    end
+
+    error = proc{artist.destroy}.must_raise Sequel::AssociationDependencyRestriction
+    error.association_path.must_equal 'comp_c1 -> guards'
+    error.example_keys.must_equal [{:g1=>7, :g2=>8}]
+    @db[:rad_comps].count.must_equal 1
+    @db[:rad_guards].count.must_equal 1
+    # Because the destroy is blocked, only the root's single graph walk runs
+    # and the shared Comp (reachable through both comp_c1 and comp_c2) is
+    # visited exactly once, keyed by its full composite primary key.
+    queries.count{|q| q.start_with?('SELECT `g1`, `g2` FROM')}.must_equal 1
+    @db[:rad_artists].count.must_equal 1
+  end
+
+  it "ignores stale in-memory association caches and uses the live association dataset" do
+    artist = @Artist.create
+    album = @Album.create(:artist_id=>artist.id, :name=>'first')
+    fresh = @Artist.with_pk(artist.id)
+    fresh.associations[:first_album] = nil
+    # DB actually still has the first album, so despite the nil cache it must block
+    proc{fresh.destroy}.must_raise Sequel::AssociationDependencyRestriction
+    @db[:rad_albums].count.must_equal 1
+  end
+
+  it "does not check restrictions hidden behind delete or nullify dependencies" do
+    # A fresh artist model :deletes its albums with a single SQL DELETE, never
+    # instantiating Album objects, so Album's tracks :restrict dependency is
+    # not reachable through the delete edge.
+    del_artist = Class.new(Sequel::Model(@db[:rad_artists]))
+    del_artist.plugin :association_dependencies
+    del_artist.one_to_many :albums, :class=>@Album, :key=>:artist_id
+    del_artist.add_association_dependencies :albums=>:delete
+    del_artist.restriction_graph?.must_equal false
+    artist = del_artist.create
+    album = @Album.create(:artist_id=>artist.id)
+    @Track.create(:album_id=>album.id)
+    artist.destroy
+    @db[:rad_albums].count.must_equal 0
+    @db[:rad_tracks].count.must_equal 1
+  end
+end
