@@ -306,4 +306,119 @@ describe "List plugin" do
     @c.create
     @db.sqls.must_equal ["SELECT max(position) AS max FROM items LIMIT 1", "INSERT INTO items (position) VALUES (2)", "SELECT * FROM items WHERE (id = 10) ORDER BY position LIMIT 1"]
   end
+
+  it "should move multiple consecutive entries upward with a fixed number of bulk updates" do
+    db = sqlite_list_database
+    item = sqlite_list_model(db)
+    5.times { |id| item.insert(id: id + 1, scope_id: 1, position: id + 1) }
+
+    item.move_many([4, 5], 2).must_equal 4
+    item.where(scope_id: 1).order(:position).select_map(:id).must_equal [1, 4, 5, 2, 3]
+    db.update_count.must_equal 3
+  end
+
+  it "should move multiple consecutive entries downward with a fixed number of bulk updates" do
+    db = sqlite_list_database
+    item = sqlite_list_model(db)
+    5.times { |id| item.insert(id: id + 1, scope_id: 1, position: id + 1) }
+
+    item.move_many([1, 2], 5).must_equal 5
+    item.where(scope_id: 1).order(:position).select_map(:id).must_equal [3, 4, 5, 1, 2]
+    db.update_count.must_equal 3
+  end
+
+  it "should move multiple entries to another scope and preserve unselected relative order" do
+    db = sqlite_list_database
+    item = sqlite_list_model(db)
+    5.times { |id| item.insert(id: id + 1, scope_id: 1, position: id + 1) }
+    3.times { |id| item.insert(id: id + 6, scope_id: 2, position: id + 1) }
+
+    item.move_many([2, 1], 2, scope_id: 2).must_equal 7
+    item.where(scope_id: 1).order(:position).select_map(:id).must_equal [3, 4, 5]
+    item.where(scope_id: 2).order(:position).select_map(:id).must_equal [6, 2, 1, 7, 8]
+    db.update_count.must_equal 3
+  end
+
+  it "should move every entry in a source scope to another scope" do
+    db = sqlite_list_database
+    item = sqlite_list_model(db)
+    3.times { |id| item.insert(id: id + 1, scope_id: 1, position: id + 1) }
+    2.times { |id| item.insert(id: id + 4, scope_id: 2, position: id + 1) }
+
+    item.move_many([2, 1, 3], 2, scope_id: 2).must_equal 4
+    item.where(scope_id: 1).count.must_equal 0
+    item.where(scope_id: 2).order(:position).select_map(:id).must_equal [4, 2, 1, 3, 5]
+    db.update_count.must_equal 3
+  end
+
+  it "should keep selected entries ordered even when they exchange positions" do
+    db = sqlite_list_database
+    item = sqlite_list_model(db)
+    5.times { |id| item.insert(id: id + 1, scope_id: 1, position: id + 1) }
+
+    item.move_many([2, 1], 2).must_equal 2
+    item.where(scope_id: 1).order(:position).select_map(:id).must_equal [3, 2, 1, 4, 5]
+    db.update_count.must_equal 3
+  end
+
+  it "should not leave temporary positions when a target constraint fails" do
+    db = sqlite_list_database("scope_id <> 2 OR position <> 1")
+    item = sqlite_list_model(db)
+    item.insert(id: 1, scope_id: 1, position: 1)
+    item.insert(id: 2, scope_id: 1, position: 2)
+
+    proc { item.move_many([1, 2], 1, scope_id: 2) }.must_raise(Sequel::ConstraintViolation)
+    item.order(:scope_id, :position).map { |row| [row.id, row.scope_id, row.position] }.
+      must_equal [[1, 1, 1], [2, 1, 2]]
+  end
+
+  it "should reject invalid move_many arguments before changing rows" do
+    db = sqlite_list_database
+    item = sqlite_list_model(db)
+    5.times { |id| item.insert(id: id + 1, scope_id: 1, position: id + 1) }
+    item.insert(id: 6, scope_id: 2, position: 1)
+
+    proc { item.move_many([1, 1], 2) }.must_raise(Sequel::Error)
+    proc { item.move_many([1, 999], 2) }.must_raise(Sequel::Error)
+    proc { item.move_many([1, 6], 2) }.must_raise(Sequel::Error)
+    db.update_count.must_equal 0
+  end
+
+  it "should not update rows when move_many does not change the list" do
+    db = sqlite_list_database
+    item = sqlite_list_model(db)
+    5.times { |id| item.insert(id: id + 1, scope_id: 1, position: id + 1) }
+
+    item.move_many([1, 2], 1).must_equal 0
+    item.where(scope_id: 1).order(:position).select_map(:id).must_equal [1, 2, 3, 4, 5]
+    db.update_count.must_equal 0
+  end
+
+  private
+
+  def sqlite_list_database(check_constraint = nil)
+    db = Sequel.sqlite
+    db.create_table :items do
+      primary_key :id
+      Integer :scope_id, null: false
+      Integer :position, null: false
+      unique [:scope_id, :position]
+      check check_constraint if check_constraint
+    end
+    def db.update_count
+      @update_count ||= 0
+    end
+    def db._execute(type, sql, opts=OPTS, &block)
+      @update_count ||= 0
+      @update_count += 1 if type == :update
+      super
+    end
+    db
+  end
+
+  def sqlite_list_model(db)
+    Class.new(Sequel::Model(db[:items])).tap do |model|
+      model.plugin :list, scope: :scope_id
+    end
+  end
 end
