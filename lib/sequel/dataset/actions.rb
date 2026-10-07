@@ -417,6 +417,58 @@ module Sequel
       end
     end
 
+    # Inserts multiple records into the associated table, given an enumerable
+    # of hashes.  Unlike #multi_insert, the hashes do not need to all have
+    # the same columns.  Each row is inserted using only the columns present
+    # in the related hash, so columns not present in the hash use the
+    # database defaults for the related columns, while columns explicitly
+    # set to nil are inserted as NULL.  An empty hash inserts a row using
+    # the database defaults for all columns:
+    #
+    #   DB[:table].import_hashes([{x: 1}, {x: 2, y: 3}, {}, {x: nil}])
+    #   # INSERT INTO table (x) VALUES (1)
+    #   # INSERT INTO table (x, y) VALUES (2, 3)
+    #   # INSERT INTO table DEFAULT VALUES
+    #   # INSERT INTO table (x) VALUES (NULL)
+    #
+    # The enumerable is processed lazily, so memory usage is bounded and
+    # does not depend on the total number of rows.  To reduce the number of
+    # INSERT statements issued, consecutive rows with the same set of
+    # columns are merged into a single INSERT statement, subject to the
+    # limits described below.  Rows are never reordered, so the database
+    # (and any triggers) sees the rows in the same order as the enumerable
+    # yields them.
+    #
+    # By default, all rows are inserted inside a single transaction, so if
+    # the enumerable raises an error part way through, or a later INSERT
+    # statement fails (e.g. due to a constraint violation), all inserted
+    # rows are rolled back.
+    #
+    # The number of rows per INSERT statement is limited by the :slice
+    # option, which defaults to default_import_slice.  The number of values
+    # (parameters) per INSERT statement is limited by the :max_params
+    # option, which defaults to default_import_max_params.  If a single row
+    # has more columns than the parameter limit allows in a single
+    # statement, an Error is raised before the row is inserted, with the
+    # row's position in the enumerable (0-based) included in the message.
+    #
+    # The return value of this method is undefined and should not be used.
+    #
+    # Options:
+    # :max_params :: The maximum number of values (parameters) to allow in
+    #                a single INSERT statement.  Defaults to
+    #                default_import_max_params.
+    # :server :: Set the server/shard to use for the transaction and insert
+    #            queries.
+    # :skip_transaction :: Do not use a transaction.
+    # :slice :: The maximum number of rows to insert with a single INSERT
+    #           statement.  Defaults to default_import_slice.
+    def import_hashes(hashes, opts=OPTS)
+      ds = opts[:server] ? server(opts[:server]) : self
+      ds._import_hashes(hashes, opts)
+      nil
+    end
+
     # Inserts values into the associated table.  The returned value is generally
     # the value of the autoincremented primary key for the inserted row, assuming that
     # a single row is inserted and the table has an autoincrementing primary key.
@@ -587,7 +639,8 @@ module Sequel
     #
     # Be aware that all hashes should have the same keys if you use this calling method,
     # otherwise some columns could be missed or set to null instead of to default
-    # values.
+    # values.  If the hashes can have different keys, use #import_hashes instead,
+    # which uses the actual keys of each hash.
     #
     # This respects the same options as #import.
     def multi_insert(hashes, opts=OPTS)
@@ -1136,6 +1189,26 @@ module Sequel
       end
     end
 
+    # Internals of #import_hashes.  Uses a single transaction for all rows
+    # unless the :skip_transaction option is given.  Does nothing if the
+    # enumerable does not yield any rows.
+    def _import_hashes(hashes, opts)
+      enum = hashes.to_enum(:each)
+      begin
+        enum.peek
+      rescue StopIteration
+        return
+      end
+
+      if opts[:skip_transaction]
+        _import_hashes_all(enum, opts)
+      else
+        trans_opts = Hash[opts]
+        trans_opts[:server] = @opts[:server]
+        @db.transaction(trans_opts){_import_hashes_all(enum, opts)}
+      end
+    end
+
     # Return an array of arrays of values given by the symbols in ret_cols.
     def _select_map_multiple(ret_cols)
       map{|r| r.values_at(*ret_cols)}
@@ -1193,6 +1266,62 @@ module Sequel
       trans_opts[:skip_transaction] = true if values.length <= 1
       @db.transaction(trans_opts, &block)
     end
+
+    # Iterate over the enumerator of hashes, inserting each row using only
+    # the columns present in the related hash.  Buffers consecutive rows
+    # with the same set of columns and inserts them with a single INSERT
+    # statement, respecting the row and parameter limits.
+    def _import_hashes_all(enum, opts)
+      slice_size = opts.fetch(:slice, default_import_slice)
+      max_params = opts.fetch(:max_params, default_import_max_params)
+      columns = nil
+      column_check = nil
+      rows = []
+      position = -1
+
+      flush = lambda do
+        unless rows.empty?
+          multi_insert_sql(columns, rows).each{|st| execute_dui(st)}
+          rows.clear
+        end
+      end
+
+      # loop stops iterating when the enumerator raises StopIteration.
+      loop do
+        hash = enum.next
+        position += 1
+        keys = hash.keys
+        ncols = keys.length
+
+        if max_params && ncols > max_params
+          raise Error, "row #{position} has #{ncols} columns, exceeding the maximum of #{max_params} parameters per INSERT statement"
+        end
+
+        if ncols == 0
+          # Empty hashes insert a row using default values for all columns,
+          # which cannot be combined with other rows.
+          flush.call
+          columns = nil
+          execute_dui(insert_sql)
+          next
+        end
+
+        if columns.nil? || ncols != columns.length || !keys.all?{|k| column_check[k]}
+          flush.call
+          columns = keys
+          column_check = {}
+          keys.each{|k| column_check[k] = true}
+        end
+
+        rows << columns.map{|c| hash[c]}
+
+        if (slice_size && rows.length >= slice_size) ||
+           (max_params && (rows.length + 1) * ncols > max_params)
+          flush.call
+        end
+      end
+      flush.call
+    end
   
     # Internals of +select_hash+ and +select_hash_groups+
     def _select_hash(meth, key_column, value_column, opts=OPTS)
@@ -1239,6 +1368,12 @@ module Sequel
     # The default number of rows that can be inserted in a single INSERT statement via import.
     # The default is for no limit.
     def default_import_slice
+      nil
+    end
+
+    # The default maximum number of values (parameters) allowed in a single
+    # INSERT statement issued by import_hashes.  The default is for no limit.
+    def default_import_max_params
       nil
     end
 

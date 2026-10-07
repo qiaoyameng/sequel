@@ -3852,6 +3852,160 @@ describe "Dataset#multi_insert" do
   end
 end
 
+describe "Dataset#import_hashes" do
+  before do
+    @db = Sequel.mock
+    @ds = @db[:items]
+  end
+
+  it "should return nil without a query if the enumerable is empty" do
+    @ds.import_hashes([]).must_be_nil
+    @db.sqls.must_equal []
+  end
+
+  it "should insert each row using only the columns in the related hash" do
+    @ds.import_hashes([{:x=>1}, {:x=>2, :y=>3}, {:x=>nil}])
+    @db.sqls.must_equal ['BEGIN',
+      "INSERT INTO items (x) VALUES (1)",
+      "INSERT INTO items (x, y) VALUES (2, 3)",
+      "INSERT INTO items (x) VALUES (NULL)",
+      'COMMIT']
+  end
+
+  it "should insert empty hashes using default values" do
+    @ds.import_hashes([{:x=>1}, {}, {}])
+    @db.sqls.must_equal ['BEGIN',
+      "INSERT INTO items (x) VALUES (1)",
+      "INSERT INTO items DEFAULT VALUES",
+      "INSERT INTO items DEFAULT VALUES",
+      'COMMIT']
+  end
+
+  it "should merge only consecutive rows with the same set of columns" do
+    @ds = @ds.with_extend{def multi_insert_sql_strategy; :values end}
+    @ds.import_hashes([{:x=>1}, {:x=>2}, {:y=>3}, {:x=>4}, {:x=>5}])
+    @db.sqls.must_equal ['BEGIN',
+      "INSERT INTO items (x) VALUES (1), (2)",
+      "INSERT INTO items (y) VALUES (3)",
+      "INSERT INTO items (x) VALUES (4), (5)",
+      'COMMIT']
+  end
+
+  it "should merge rows with the same columns in a different order" do
+    @ds = @ds.with_extend{def multi_insert_sql_strategy; :values end}
+    @ds.import_hashes([{:x=>1, :y=>2}, {:y=>4, :x=>3}])
+    @db.sqls.must_equal ['BEGIN',
+      "INSERT INTO items (x, y) VALUES (1, 2), (3, 4)",
+      'COMMIT']
+  end
+
+  it "should accept an enumerator and process it lazily" do
+    yielded = []
+    enum = Enumerator.new do |y|
+      3.times do |i|
+        yielded << i
+        y << {:x=>i}
+      end
+    end
+    @ds.import_hashes(enum)
+    yielded.must_equal [0, 1, 2]
+    @db.sqls.must_equal ['BEGIN',
+      "INSERT INTO items (x) VALUES (0)",
+      "INSERT INTO items (x) VALUES (1)",
+      "INSERT INTO items (x) VALUES (2)",
+      'COMMIT']
+  end
+
+  it "should accept string keys as column names" do
+    @ds.import_hashes([{'x'=>1}, {'y'=>2}])
+    @db.sqls.must_equal ['BEGIN',
+      "INSERT INTO items (x) VALUES (1)",
+      "INSERT INTO items (y) VALUES (2)",
+      'COMMIT']
+  end
+
+  it "should accept a :skip_transaction option to skip transactions" do
+    @ds.import_hashes([{:x=>1}, {:y=>2}], :skip_transaction=>true)
+    @db.sqls.must_equal [
+      "INSERT INTO items (x) VALUES (1)",
+      "INSERT INTO items (y) VALUES (2)",
+    ]
+  end
+
+  it "should slice based on the default_import_slice option" do
+    @ds = @ds.with_extend do
+      def default_import_slice; 2 end
+      def multi_insert_sql_strategy; :values end
+    end
+    @ds.import_hashes([{:x=>1}, {:x=>2}, {:x=>3}])
+    @db.sqls.must_equal ['BEGIN',
+      "INSERT INTO items (x) VALUES (1), (2)",
+      "INSERT INTO items (x) VALUES (3)",
+      'COMMIT']
+  end
+
+  it "should accept the :slice option for the maximum rows per INSERT statement" do
+    @ds = @ds.with_extend{def multi_insert_sql_strategy; :values end}
+    @ds.import_hashes([{:x=>1}, {:x=>2}, {:x=>3}], :slice=>2)
+    @db.sqls.must_equal ['BEGIN',
+      "INSERT INTO items (x) VALUES (1), (2)",
+      "INSERT INTO items (x) VALUES (3)",
+      'COMMIT']
+  end
+
+  it "should slice based on the default_import_max_params option" do
+    @ds = @ds.with_extend do
+      def default_import_max_params; 4 end
+      def multi_insert_sql_strategy; :values end
+    end
+    @ds.import_hashes([{:x=>1, :y=>1}, {:x=>2, :y=>2}, {:x=>3, :y=>3}])
+    @db.sqls.must_equal ['BEGIN',
+      "INSERT INTO items (x, y) VALUES (1, 1), (2, 2)",
+      "INSERT INTO items (x, y) VALUES (3, 3)",
+      'COMMIT']
+  end
+
+  it "should accept the :max_params option for the maximum parameters per INSERT statement" do
+    @ds = @ds.with_extend{def multi_insert_sql_strategy; :values end}
+    @ds.import_hashes([{:x=>1, :y=>1}, {:x=>2, :y=>2}, {:x=>3, :y=>3}], :max_params=>4)
+    @db.sqls.must_equal ['BEGIN',
+      "INSERT INTO items (x, y) VALUES (1, 1), (2, 2)",
+      "INSERT INTO items (x, y) VALUES (3, 3)",
+      'COMMIT']
+  end
+
+  it "should raise an error with the row position before executing a row exceeding the parameter limit" do
+    @ds = @ds.with_extend{def default_import_max_params; 2 end}
+    e = proc{@ds.import_hashes([{:x=>1}, {:x=>1, :y=>2, :z=>3}])}.must_raise Sequel::Error
+    e.message.must_include 'row 1'
+    @db.sqls.must_equal ['BEGIN', 'ROLLBACK']
+  end
+
+  it "should roll back all rows if the enumerable raises part way through" do
+    enum = Enumerator.new do |y|
+      y << {:x=>1}
+      y << {:y=>2}
+      raise 'enumerator failure'
+    end
+    proc{@ds.import_hashes(enum)}.must_raise RuntimeError
+    @db.sqls.must_equal ['BEGIN',
+      "INSERT INTO items (x) VALUES (1)",
+      'ROLLBACK']
+  end
+
+  it "should roll back all rows if a later INSERT statement fails" do
+    def (@db)._numrows(sql, *)
+      raise Sequel::DatabaseError if sql.include?('(2)')
+      super
+    end
+    proc{@ds.import_hashes([{:x=>1}, {:x=>2}])}.must_raise Sequel::DatabaseError
+    @db.sqls.must_equal ['BEGIN',
+      "INSERT INTO items (x) VALUES (1)",
+      "INSERT INTO items (x) VALUES (2)",
+      'ROLLBACK']
+  end
+end
+
 describe "Dataset#update_sql" do
   before do
     @ds = Sequel.mock.dataset.from(:items)

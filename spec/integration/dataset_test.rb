@@ -1222,6 +1222,65 @@ describe "Sequel::Dataset#import and #multi_insert" do
   end
 end
 
+describe "Sequel::Dataset#import_hashes" do
+  before(:all) do
+    @db = DB
+    @db.create_table!(:imph) do
+      primary_key :id
+      Integer :i
+      Integer :j, :default=>10
+    end
+    @ds = @db[:imph]
+  end
+  before do
+    @ds.delete
+  end
+  after(:all) do
+    @db.drop_table?(:imph)
+  end
+
+  it "should insert each row using only the columns in the related hash" do
+    @ds.import_hashes([{:i=>1}, {:i=>2, :j=>3}, {:i=>nil}, {}])
+    @ds.order(:id).map{|r| [r[:i], r[:j]]}.must_equal [[1, 10], [2, 3], [nil, 10], [nil, 10]]
+  end
+
+  it "should roll back all rows when a later batch violates a constraint" do
+    @db.add_index :imph, :i, :unique=>true, :name=>:imph_i_unique
+    begin
+      @ds.import_hashes([{:i=>1}])
+      proc{@ds.import_hashes([{:i=>2}, {:i=>3, :j=>4}, {:i=>1}])}.must_raise Sequel::ConstraintViolation
+      @ds.order(:id).map{|r| [r[:i], r[:j]]}.must_equal [[1, 10]]
+    ensure
+      @db.drop_index :imph, :i, :name=>:imph_i_unique
+    end
+  end
+
+  if DB.database_type == :sqlite
+    it "should preserve insertion order seen by triggers and roll back trigger writes on failure" do
+      @db.create_table!(:imph_log){primary_key :id; Integer :i}
+      @db.run("CREATE TRIGGER imph_log_trg AFTER INSERT ON imph BEGIN INSERT INTO imph_log (i) VALUES (NEW.i); END")
+      begin
+        @ds.import_hashes([{:i=>1}, {:i=>2, :j=>3}, {}, {:i=>4}])
+        @db[:imph_log].order(:id).map(:i).must_equal [1, 2, nil, 4]
+
+        @ds.delete
+        @db[:imph_log].delete
+        @db.add_index :imph, :i, :unique=>true, :name=>:imph_i_unique
+        begin
+          proc{@ds.import_hashes([{:i=>5}, {:i=>6, :j=>7}, {:i=>5}])}.must_raise Sequel::ConstraintViolation
+        ensure
+          @db.drop_index :imph, :i, :name=>:imph_i_unique
+        end
+        @ds.all.must_equal []
+        @db[:imph_log].all.must_equal []
+      ensure
+        @db.run("DROP TRIGGER IF EXISTS imph_log_trg")
+        @db.drop_table?(:imph_log)
+      end
+    end
+  end
+end
+
 describe "Sequel::Dataset#import and #multi_insert :return=>:primary_key" do
   before do
     @db = DB
