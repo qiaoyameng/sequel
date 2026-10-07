@@ -23,6 +23,32 @@ describe "List plugin" do
     @db.reset
   end
 
+  def sqlite_list_model
+    db = Sequel.sqlite
+    db.create_table!(:list_items) do
+      primary_key :id
+      Integer :scope_id, :null=>false
+      Integer :position, :null=>false
+      index [:scope_id, :position], :unique=>true
+    end
+    item = Class.new(Sequel::Model(db[:list_items]))
+    item.plugin :list, :scope=>:scope_id
+    [db, item]
+  end
+
+  def track_sql_statements(db)
+    statements = []
+    logger = Object.new
+    logger.define_singleton_method(:info) do |message|
+      statements << message.sub(/\A\([0-9.]+s\) /, "")
+    end
+    logger.define_singleton_method(:error) do |message|
+      statements << message.rpartition(": ").last
+    end
+    db.loggers << logger
+    statements
+  end
+
   it "should default to using :position as the position field" do
     @c.position_field.must_equal :position
     @c.new.list_dataset.sql.must_equal 'SELECT * FROM items ORDER BY position'
@@ -249,6 +275,87 @@ describe "List plugin" do
     @db.sqls.must_equal ["SELECT max(position) AS max FROM items LIMIT 1",
       "UPDATE items SET position = (position - 1) WHERE ((position >= 4) AND (position <= 4))",
       "UPDATE items SET position = 4 WHERE (id = 7)"]
+  end
+
+  it "should have move_many reject duplicate primary keys before querying" do
+    proc{@c.move_many([1, 1], 1)}.must_raise Sequel::Error
+    @db.sqls.must_equal []
+  end
+
+  it "should have move_many reject members from multiple source scopes" do
+    @c.dataset = @c.dataset.with_fetch(
+      [{:id=>1, :scope_id=>1, :position=>1},
+       {:id=>2, :scope_id=>2, :position=>1}])
+    proc{@sc.move_many([1, 2], 1)}.must_raise Sequel::Error
+    @db.sqls.must_equal ["SELECT * FROM items WHERE (id IN (1, 2)) ORDER BY scope_id, position"]
+  end
+
+  it "should have move_many reject missing members" do
+    @c.dataset = @c.dataset.with_fetch({:id=>1, :position=>1})
+    proc{@c.move_many([1, 2], 1)}.must_raise Sequel::Error
+    @db.sqls.must_equal ["SELECT * FROM items WHERE (id IN (1, 2)) ORDER BY position"]
+  end
+
+  it "should move many members forward together in SQLite with a unique scope position index" do
+    db, item = sqlite_list_model
+    1.upto(5){|id| db[:list_items].insert(:scope_id=>1, :position=>id)}
+    statements = track_sql_statements(db)
+
+    update_count = item.move_many([4, 5], 1)
+
+    update_count.must_equal 5
+    item.order(:scope_id, :position).map(:id).must_equal [4, 5, 1, 2, 3]
+    statements.count{|sql| sql =~ /\AUPDATE /}.must_equal 2
+  end
+
+  it "should move many members backward together in SQLite with a unique scope position index" do
+    db, item = sqlite_list_model
+    1.upto(5){|id| db[:list_items].insert(:scope_id=>1, :position=>id)}
+    statements = track_sql_statements(db)
+
+    update_count = item.move_many([1, 2], 4)
+
+    update_count.must_equal 5
+    item.order(:scope_id, :position).map(:id).must_equal [3, 4, 5, 1, 2]
+    statements.count{|sql| sql =~ /\AUPDATE /}.must_equal 2
+  end
+
+  it "should move many members between scopes in SQLite with a unique scope position index" do
+    db, item = sqlite_list_model
+    1.upto(5){|id| db[:list_items].insert(:scope_id=>1, :position=>id)}
+    1.upto(3){|id| db[:list_items].insert(:scope_id=>2, :position=>id)}
+    statements = track_sql_statements(db)
+
+    update_count = item.move_many([1, 2], 2, :scope=>2)
+
+    update_count.must_equal 8
+    item.where(:scope_id=>1).order(:position).map(:id).must_equal [3, 4, 5]
+    item.where(:scope_id=>2).order(:position).map(:id).must_equal [6, 1, 2, 7, 8]
+    statements.count{|sql| sql =~ /\AUPDATE /}.must_equal 2
+  end
+
+  it "should roll back move_many when a target database constraint fails in SQLite" do
+    db, item = sqlite_list_model
+    db.run <<~SQL
+      CREATE TRIGGER list_items_target_scope_constraint
+      BEFORE UPDATE OF scope_id ON list_items
+      WHEN NEW.scope_id = 2 AND OLD.scope_id != 2
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid target scope');
+      END;
+    SQL
+    1.upto(5){|id| db[:list_items].insert(:scope_id=>1, :position=>id)}
+    db[:list_items].insert(:scope_id=>2, :position=>1)
+    statements = track_sql_statements(db)
+    member = item[1]
+
+    proc{item.move_many([1, 2], 1, :scope=>2)}.must_raise Sequel::DatabaseError
+
+    item.where(:scope_id=>1).order(:position).map(:id).must_equal [1, 2, 3, 4, 5]
+    item.where(:scope_id=>2).order(:position).map(:id).must_equal [6]
+    member.scope_id.must_equal 1
+    member.position.must_equal 1
+    statements.count{|sql| sql =~ /\AUPDATE /}.must_equal 2
   end
 
   it "should have next return the next entry in the list if not given an argument" do
