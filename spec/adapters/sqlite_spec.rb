@@ -528,6 +528,105 @@ describe "SQLite dataset" do
   end if IDENTIFIER_MANGLING
 end
 
+describe "SQLite dataset paged_each :keyset strategy" do
+  before do
+    DB.create_table! :keyset_items do
+      primary_key :id
+      Integer :a
+      Integer :b
+    end
+    @ds = DB[:keyset_items]
+    [
+      [nil, 1], [nil, 2], [1, nil], [1, 1], [1, 1],
+      [2, 2], [2, nil], [nil, 1], [3, 3], [1, nil],
+    ].each{|a, b| @ds.insert(:a=>a, :b=>b)}
+  end
+  after do
+    DB.drop_table?(:keyset_items)
+  end
+
+  it "should match one-shot ORDER BY results for data with ties and NULLs" do
+    orders = [
+      Sequel.asc(:a, :nulls=>:first),
+      Sequel.asc(:a, :nulls=>:last),
+      Sequel.desc(:a, :nulls=>:first),
+      Sequel.desc(:a, :nulls=>:last),
+      Sequel.asc(:a),
+      Sequel.desc(:a),
+      :a,
+    ]
+    orders.each do |o1|
+      [:asc, :desc].each do |dir|
+        [nil, :first, :last].each do |nulls|
+          o2 = Sequel.send(dir, :b, :nulls=>nulls)
+          ds = @ds.order(o1, o2, :id)
+          expected = ds.all
+          [1, 2, 3, 4, 7, 100].each do |rows_per_fetch|
+            rows = []
+            ds.paged_each(:strategy=>:keyset, :unique_key=>[:id], :rows_per_fetch=>rows_per_fetch){|row| rows << row}
+            rows.must_equal expected
+          end
+        end
+      end
+    end
+  end
+
+  it "should keep existing filters and respect an existing limit" do
+    ds = @ds.where(Sequel.|({:a=>1}, {:b=>2})).order(Sequel.desc(:a, :nulls=>:last), :id)
+    expected = ds.all
+    rows = []
+    ds.paged_each(:strategy=>:keyset, :unique_key=>[:id], :rows_per_fetch=>2){|row| rows << row}
+    rows.must_equal expected
+
+    rows = []
+    ds.limit(3).paged_each(:strategy=>:keyset, :unique_key=>[:id], :rows_per_fetch=>2){|row| rows << row}
+    rows.must_equal expected.first(3)
+  end
+
+  it "should not leak internal sort helper columns into returned rows" do
+    ds = @ds.order(Sequel.function(:coalesce, :a, 99), :id)
+    expected = ds.all
+    rows = []
+    ds.paged_each(:strategy=>:keyset, :unique_key=>[:id], :rows_per_fetch=>3){|row| rows << row}
+    rows.must_equal expected
+    rows.each{|row| row.keys.must_equal [:id, :a, :b]}
+
+    ds = @ds.select(:id, :a).order(Sequel.desc(:b, :nulls=>:first), :id)
+    expected = ds.all
+    rows = []
+    ds.paged_each(:strategy=>:keyset, :unique_key=>[:id], :rows_per_fetch=>3){|row| rows << row}
+    rows.must_equal expected
+    rows.each{|row| row.keys.must_equal [:id, :a]}
+  end
+
+  it "should support resuming from a mid-way boundary" do
+    ds = @ds.order(Sequel.asc(:a, :nulls=>:first), Sequel.desc(:b, :nulls=>:last), :id)
+    expected = ds.all
+    first, boundary_row = [], nil
+    ds.paged_each(:strategy=>:keyset, :unique_key=>[:id], :rows_per_fetch=>3) do |row|
+      first << row
+      if first.length == 5
+        boundary_row = row
+        break
+      end
+    end
+    first.must_equal expected.first(5)
+
+    keyset_exprs = ds.send(:_paged_each_keyset_order_expressions, [:id]).first
+    values = [boundary_row[:a], boundary_row[:b], boundary_row[:id]]
+    remaining = []
+    ds.where(ds.send(:_paged_each_keyset_condition, keyset_exprs, values)).
+      paged_each(:strategy=>:keyset, :unique_key=>[:id], :rows_per_fetch=>2){|row| remaining << row}
+    (first + remaining).must_equal expected
+  end
+
+  it "should raise an error without a :unique_key option forming the final part of the order" do
+    proc{@ds.order(:a, :id).paged_each(:strategy=>:keyset){|row|}}.must_raise(Sequel::Error)
+    proc{@ds.order(:a, :id).paged_each(:strategy=>:keyset, :unique_key=>[]){|row|}}.must_raise(Sequel::Error)
+    proc{@ds.order(:a, :id).paged_each(:strategy=>:keyset, :unique_key=>[:a]){|row|}}.must_raise(Sequel::Error)
+  end
+end
+
 describe "A SQLite database" do
   before do
     @db = DB

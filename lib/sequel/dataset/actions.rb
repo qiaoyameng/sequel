@@ -605,6 +605,10 @@ module Sequel
     # must have unambiguous order.  Using an ambiguous order can result in an infinite loop,
     # as well as subtler bugs such as yielding duplicate rows or rows being skipped.
     #
+    # The consistency guarantee only covers static data.  Concurrent modifications of the
+    # columns used in the sort key while paging are not covered; such modifications can
+    # result in rows being skipped or yielded more than once.
+    #
     # Sequel checks that the datasets using this method have an order, but it cannot
     # ensure that the order is unambiguous.
     #
@@ -615,13 +619,27 @@ module Sequel
     # Options:
     # :rows_per_fetch :: The number of rows to fetch per query.  Defaults to 1000.
     # :strategy :: The strategy to use for paging of results.  By default this is :offset,
-    #              for using an approach with a limit and offset for every page.  This can
+    #              for using a limit and offset for every page.  This can
     #              be set to :filter, which uses a limit and a filter that excludes
     #              rows from previous pages.  In order for this strategy to work, you must be
     #              selecting the columns you are ordering by, and none of the columns can contain
-    #              NULLs.  Note that some Sequel adapters have optimized implementations that will
+    #              NULLs.  It can also be set to :keyset, which also uses a limit and a filter
+    #              that excludes rows from previous pages, but supports ordering by columns
+    #              that contain NULLs, by building the boundary for the next page from the
+    #              complete sort tuple, handling each column's ASC/DESC and NULLS FIRST/LAST
+    #              ordering separately.  Order entries that do not specify NULLS FIRST/LAST
+    #              are normalized to the database's default NULL ordering.  The :keyset
+    #              strategy requires the :unique_key option.
+    #              Note that some Sequel adapters have optimized implementations that will
     #              use cursors or streaming regardless of the :strategy option used.
-    # :filter_values :: If the strategy: :filter option is used, this option should be a proc
+    # :unique_key :: If the strategy: :keyset option is used, this option is required, and
+    #               should be an array of columns/expressions that form a unique key for the
+    #               dataset, appearing as the final entries of the dataset's ORDER BY clause.
+    #               Without a unique key as the final part of the sort, a stable pagination
+    #               order cannot be promised, so this strategy raises an error if the option
+    #               is not provided.
+    # :filter_values :: If the strategy: :filter or strategy: :keyset option is used,
+    #                   this option should be a proc
     #                   that accepts the last retrieved row for the previous page and an array of
     #                   ORDER BY expressions, and returns an array of values relating to those
     #                   expressions for the last retrieved row.  You will need to use this option
@@ -653,6 +671,12 @@ module Sequel
     #   # SELECT * FROM table ORDER BY id LIMIT 1000
     #   # SELECT * FROM table WHERE id > 1001 ORDER BY id LIMIT 1000
     #   # ...
+    #
+    #   DB[:table].order(Sequel.desc(:created_at, nulls: :first), :id).
+    #     paged_each(strategy: :keyset, unique_key: [:id]){|row| }
+    #   # SELECT * FROM table ORDER BY created_at DESC NULLS FIRST, id ASC NULLS FIRST LIMIT 1000
+    #   # SELECT * FROM table WHERE (created_at IS NULL) OR ... ORDER BY ... LIMIT 1000
+    #   # ...
     def paged_each(opts=OPTS)
       unless @opts[:order]
         raise Sequel::Error, "Dataset#paged_each requires the dataset be ordered"
@@ -669,14 +693,55 @@ module Sequel
       end
 
       rows_per_fetch = opts[:rows_per_fetch] || 1000
-      strategy = if offset || total_limit
+      strategy = if offset
         :offset
       else
         opts[:strategy] || :offset
       end
 
+      if strategy == :keyset
+        unique_key = opts[:unique_key]
+        unless unique_key.is_a?(Array) && !unique_key.empty?
+          raise Sequel::Error, "Dataset#paged_each with strategy: :keyset requires the :unique_key option, an array of columns/expressions forming the unique final part of the dataset's order, to promise stable pagination"
+        end
+        keyset_exprs, keyset_order = _paged_each_keyset_order_expressions(unique_key)
+      end
+
       db.transaction(opts) do
         case strategy
+        when :keyset
+          filter_values = opts[:filter_values]
+          ds = limit(rows_per_fetch)
+          ds = ds.order(*keyset_order) if keyset_order
+          unless filter_values
+            ds, keyset_aliases, keyset_appended = _paged_each_keyset_select(ds, keyset_exprs)
+          end
+          base_ds = ds
+
+          remaining = total_limit
+          while ds
+            ds = ds.limit(remaining) if remaining && remaining < rows_per_fetch
+            last_row = nil
+            ds.each do |row|
+              last_row = row
+              if keyset_appended && !keyset_appended.empty? && row.is_a?(Hash)
+                row = row.dup
+                keyset_appended.each{|a| row.delete(a)}
+              end
+              yield row
+            end
+            break unless last_row
+            if remaining
+              remaining -= rows_per_fetch
+              break if remaining <= 0
+            end
+            values = if filter_values
+              filter_values.call(last_row, keyset_exprs.map{|e| e[0]})
+            else
+              keyset_aliases.map{|a| last_row[a]}
+            end
+            ds = base_ds.where(_paged_each_keyset_condition(keyset_exprs, values))
+          end
         when :filter
           filter_values = opts[:filter_values] || proc{|row, exprs| exprs.map{|e| row[hash_key_symbol(e)]}}
           base_ds = ds = limit(rows_per_fetch)
@@ -1341,6 +1406,125 @@ module Sequel
         Sequel.&(*expr)
       end
       Sequel.|(*cond)
+    end
+
+    # The order expressions to use for the paged_each :keyset strategy.
+    # Returns an array with two entries.  The first is an array of
+    # [expression, descending, nulls] tuples, one for each entry in the
+    # dataset's order, with nulls always :first or :last.  The second is a
+    # normalized version of the dataset's order with explicit NULLS
+    # FIRST/LAST for entries that did not specify it, or nil if all entries
+    # specified NULLS FIRST/LAST.  Raises an error unless the given unique
+    # key forms the final part of the dataset's order.
+    def _paged_each_keyset_order_expressions(unique_key)
+      order = @opts[:order]
+      n = unique_key.length
+      expressions = order.map do |v|
+        v.is_a?(SQL::OrderedExpression) ? v.expression : v
+      end
+      key_expressions = unique_key.map do |v|
+        v.is_a?(SQL::OrderedExpression) ? v.expression : v
+      end
+      unless expressions.length >= n && expressions[-n..] == key_expressions
+        raise Sequel::Error, "Dataset#paged_each :unique_key option (#{unique_key.inspect}) must be the final part of the dataset's order (#{order.inspect}) to promise stable pagination"
+      end
+
+      normalized = nil
+      tuples = order.each_with_index.map do |v, i|
+        if v.is_a?(SQL::OrderedExpression)
+          expr = v.expression
+          descending = v.descending
+          nulls = v.nulls
+        else
+          expr = v
+          descending = false
+          nulls = nil
+        end
+
+        unless nulls
+          nulls = if sorts_nulls_first_by_default?
+            descending ? :last : :first
+          else
+            descending ? :first : :last
+          end
+          normalized ||= order.dup
+          normalized[i] = SQL::OrderedExpression.new(expr, descending, :nulls=>nulls)
+        end
+
+        [expr, descending, nulls]
+      end
+
+      [tuples, normalized]
+    end
+
+    # For the paged_each :keyset strategy, append select columns with aliases
+    # for any order expressions that cannot be retrieved from the returned
+    # rows directly.  Returns the dataset to use, the array of aliases used
+    # to retrieve the order expression values, and the array of aliases that
+    # were appended to the SELECT list (which must be removed from returned
+    # rows before yielding them).
+    def _paged_each_keyset_select(ds, keyset_exprs)
+      aliases = []
+      appended = []
+      selected_keys = if (select = @opts[:select])
+        select.map{|s| begin; hash_key_symbol(s); rescue Sequel::Error; nil; end}
+      end
+      keyset_exprs.each_with_index do |(v, _), i|
+        begin
+          key = hash_key_symbol(v)
+          # If the dataset has an explicit SELECT list, the order expression
+          # value can only be retrieved from the returned rows if one of the
+          # SELECT entries uses the same hash key.
+          if selected_keys && !selected_keys.include?(key)
+            raise Sequel::Error
+          end
+          aliases << key
+        rescue Sequel::Error
+          alias_sym = :"_sequel_keyset_#{i}".to_sym
+          ds = ds.select_append(SQL::AliasedExpression.new(v, alias_sym))
+          aliases << alias_sym
+          appended << alias_sym
+        end
+      end
+      [ds, aliases, appended]
+    end
+
+    # The condition selecting rows after the row with the given order values,
+    # for the paged_each :keyset strategy.  Builds the boundary from the
+    # complete sort tuple, handling each expression's ASC/DESC and NULLS
+    # FIRST/LAST ordering separately, so that NULL values are never used
+    # directly as the argument of a > or < comparison.
+    def _paged_each_keyset_condition(keyset_exprs, values)
+      prefix = []
+      conds = keyset_exprs.zip(values).map do |(v, descending, nulls), value|
+        if value.nil?
+          if nulls == :first
+            # NULLs sort before all non-NULL values for this expression, so
+            # all non-NULL values come after a NULL boundary value.
+            after = SQL::BooleanExpression.new(:'IS NOT', v, nil)
+          else
+            # NULLs sort after all non-NULL values for this expression, so
+            # nothing comes after a NULL boundary value for this expression.
+            after = SQL::Constants::SQLFALSE
+          end
+          eq = SQL::BooleanExpression.new(:IS, v, nil)
+        else
+          after = SQL::BooleanExpression.new(descending ? :< : :>, v, value)
+          if nulls == :first
+            # NULLs sort before all non-NULL values for this expression, so
+            # they never come after a non-NULL boundary value.
+            eq = SQL::BooleanExpression.new(:'IS NOT', v, nil) & SQL::BooleanExpression.new(:'=', v, value)
+          else
+            # NULLs sort after all non-NULL values for this expression.
+            after = SQL::BooleanExpression.new(:IS, v, nil) | after
+            eq = SQL::BooleanExpression.new(:'=', v, value)
+          end
+        end
+        cond = Sequel.&(*(prefix + [after]))
+        prefix << eq
+        cond
+      end
+      Sequel.|(*conds)
     end
 
     # Downcase identifiers by default when outputting them from the database.

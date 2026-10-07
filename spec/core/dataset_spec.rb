@@ -6049,6 +6049,70 @@ describe "Dataset#paged_each" do
       "SELECT * FROM test WHERE ((z > 8) OR ((z = 8) AND ((test.y * 2) < 6)) OR ((z = 8) AND ((test.y * 2) = 6) AND (x > 8))) ORDER BY z, (test.y * 2) DESC, x ASC LIMIT 5"]
     @rows.must_equal db
   end
+
+  it "should support :strategy=>:keyset" do
+    @ds = @ds.with_fetch(@db.each_slice(5).to_a)
+    @ds.paged_each(:rows_per_fetch=>5, :strategy=>:keyset, :unique_key=>[:x], &@proc)
+    @ds.db.sqls[1...-1].must_equal ["SELECT * FROM test ORDER BY x ASC NULLS FIRST LIMIT 5",
+      "SELECT * FROM test WHERE (x > 4) ORDER BY x ASC NULLS FIRST LIMIT 5",
+      "SELECT * FROM test WHERE (x > 9) ORDER BY x ASC NULLS FIRST LIMIT 5"]
+    @rows.must_equal @db
+  end
+
+  it "should support :strategy=>:keyset with per-column ASC/DESC and NULLS FIRST/LAST" do
+    db = @db.map{|h| h[:y] = h[:x] % 5; h[:z] = h[:x] % 9; h}.sort_by{|h| [h[:z] || -1, -(h[:y] || 99), h[:x]]}
+    @ds = @ds.with_fetch(db.each_slice(5).to_a)
+    @ds.order(Sequel.asc(:z, :nulls=>:first), Sequel.desc(:y), :x).paged_each(:rows_per_fetch=>5, :strategy=>:keyset, :unique_key=>[:x], &@proc)
+    @ds.db.sqls[1...-1].must_equal ["SELECT * FROM test ORDER BY z ASC NULLS FIRST, y DESC NULLS LAST, x ASC NULLS FIRST LIMIT 5",
+      "SELECT * FROM test WHERE ((z > 3) OR ((z IS NOT NULL) AND (z = 3) AND ((y IS NULL) OR (y < 3))) OR ((z IS NOT NULL) AND (z = 3) AND (y = 3) AND (x > 3))) ORDER BY z ASC NULLS FIRST, y DESC NULLS LAST, x ASC NULLS FIRST LIMIT 5",
+      "SELECT * FROM test WHERE ((z > 8) OR ((z IS NOT NULL) AND (z = 8) AND ((y IS NULL) OR (y < 3))) OR ((z IS NOT NULL) AND (z = 8) AND (y = 3) AND (x > 8))) ORDER BY z ASC NULLS FIRST, y DESC NULLS LAST, x ASC NULLS FIRST LIMIT 5"]
+    @rows.must_equal db
+  end
+
+  it "should support :strategy=>:keyset with NULL boundary values" do
+    db = [{:x=>nil, :id=>1}, {:x=>nil, :id=>2}, {:x=>1, :id=>3}]
+    @ds = @ds.with_fetch(db.each_slice(2).to_a)
+    @ds.order(Sequel.asc(:x, :nulls=>:first), :id).paged_each(:rows_per_fetch=>2, :strategy=>:keyset, :unique_key=>[:id], &@proc)
+    @ds.db.sqls[1...-1].must_equal ["SELECT * FROM test ORDER BY x ASC NULLS FIRST, id ASC NULLS FIRST LIMIT 2",
+      "SELECT * FROM test WHERE ((x IS NOT NULL) OR ((x IS NULL) AND (id > 2))) ORDER BY x ASC NULLS FIRST, id ASC NULLS FIRST LIMIT 2",
+      "SELECT * FROM test WHERE ((x > 1) OR ((x IS NOT NULL) AND (x = 1) AND (id > 3))) ORDER BY x ASC NULLS FIRST, id ASC NULLS FIRST LIMIT 2"]
+    @rows.must_equal db
+  end
+
+  it "should support :strategy=>:keyset with an existing limit" do
+    @ds = @ds.with_fetch([@db[0, 3], @db[3, 2]])
+    @ds.limit(5).paged_each(:rows_per_fetch=>3, :strategy=>:keyset, :unique_key=>[:x], &@proc)
+    @ds.db.sqls[1...-1].must_equal ["SELECT * FROM test ORDER BY x ASC NULLS FIRST LIMIT 3",
+      "SELECT * FROM test WHERE (x > 2) ORDER BY x ASC NULLS FIRST LIMIT 2"]
+    @rows.must_equal @db.first(5)
+  end
+
+  it "should support :strategy=>:keyset with :filter_values option" do
+    db = @db.map{|h| h[:y] = h[:x] % 5; h}.sort_by{|h| [h[:y], h[:x]]}
+    @ds = @ds.with_fetch(db.each_slice(5).to_a)
+    @ds.order(Sequel.*(:y, 2), :x).paged_each(:rows_per_fetch=>5, :strategy=>:keyset, :unique_key=>[:x], :filter_values=>proc{|row, _| [row[:y] * 2, row[:x]]}, &@proc)
+    @ds.db.sqls[1...-1].must_equal ["SELECT * FROM test ORDER BY (y * 2) ASC NULLS FIRST, x ASC NULLS FIRST LIMIT 5",
+      "SELECT * FROM test WHERE (((y * 2) > 4) OR (((y * 2) IS NOT NULL) AND ((y * 2) = 4) AND (x > 2))) ORDER BY (y * 2) ASC NULLS FIRST, x ASC NULLS FIRST LIMIT 5",
+      "SELECT * FROM test WHERE (((y * 2) > 8) OR (((y * 2) IS NOT NULL) AND ((y * 2) = 8) AND (x > 9))) ORDER BY (y * 2) ASC NULLS FIRST, x ASC NULLS FIRST LIMIT 5"]
+    @rows.must_equal db
+  end
+
+  it "should support :strategy=>:keyset with aliased select for order expressions not in the SELECT list" do
+    db = @db.map{|h| h[:y] = h[:x] % 5; h}.sort_by{|h| [h[:y], h[:x]]}
+    @ds = @ds.select(:x).order(Sequel.+(:y, 1), :x).with_fetch(db.each_slice(5).to_a.map{|a| a.map{|h| {:x=>h[:x], :_sequel_keyset_0=>h[:y] + 1}}})
+    @ds.paged_each(:rows_per_fetch=>5, :strategy=>:keyset, :unique_key=>[:x], &@proc)
+    @ds.db.sqls[1...-1].must_equal ["SELECT x, (y + 1) AS _sequel_keyset_0 FROM test ORDER BY (y + 1) ASC NULLS FIRST, x ASC NULLS FIRST LIMIT 5",
+      "SELECT x, (y + 1) AS _sequel_keyset_0 FROM test WHERE (((y + 1) > 3) OR (((y + 1) IS NOT NULL) AND ((y + 1) = 3) AND (x > 2))) ORDER BY (y + 1) ASC NULLS FIRST, x ASC NULLS FIRST LIMIT 5",
+      "SELECT x, (y + 1) AS _sequel_keyset_0 FROM test WHERE (((y + 1) > 5) OR (((y + 1) IS NOT NULL) AND ((y + 1) = 5) AND (x > 9))) ORDER BY (y + 1) ASC NULLS FIRST, x ASC NULLS FIRST LIMIT 5"]
+    @rows.must_equal db.map{|h| {:x=>h[:x]}}
+  end
+
+  it "should raise an error for :strategy=>:keyset without a valid :unique_key option" do
+    proc{@ds.paged_each(:strategy=>:keyset, &@proc)}.must_raise(Sequel::Error)
+    proc{@ds.paged_each(:strategy=>:keyset, :unique_key=>[], &@proc)}.must_raise(Sequel::Error)
+    proc{@ds.paged_each(:strategy=>:keyset, :unique_key=>:x, &@proc)}.must_raise(Sequel::Error)
+    proc{@ds.order(:x, :y).paged_each(:strategy=>:keyset, :unique_key=>[:x], &@proc)}.must_raise(Sequel::Error)
+  end
 end
 
 describe "Dataset#current_datetime" do

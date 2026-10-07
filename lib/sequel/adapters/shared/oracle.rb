@@ -544,6 +544,12 @@ module Sequel
         server_version >= 10010002
       end
 
+      # Oracle sorts NULL values after non-NULL values by default in
+      # ascending order, and before non-NULL values in descending order.
+      def sorts_nulls_first_by_default?
+        false
+      end
+
       private
 
       # Handle nil, false, and true MERGE WHEN conditions to avoid non-boolean

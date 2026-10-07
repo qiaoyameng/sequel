@@ -2522,6 +2522,12 @@ module Sequel
         true
       end
 
+      # PostgreSQL sorts NULL values after non-NULL values by default in
+      # ascending order, and before non-NULL values in descending order.
+      def sorts_nulls_first_by_default?
+        false
+      end
+
       # PostgreSQL 9.5+ supports SKIP LOCKED.
       def supports_skip_locked?
         server_version >= 90500

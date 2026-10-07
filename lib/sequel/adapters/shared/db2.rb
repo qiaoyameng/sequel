@@ -473,6 +473,12 @@ module Sequel
         true
       end
 
+      # DB2 sorts NULL values after non-NULL values by default in
+      # ascending order, and before non-NULL values in descending order.
+      def sorts_nulls_first_by_default?
+        false
+      end
+
       # Modify the sql to limit the number of rows returned.
       # Uses :offset_strategy Database option to determine how to format the
       # limit and offset.

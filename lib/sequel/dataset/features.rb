@@ -254,6 +254,15 @@ module Sequel
       false
     end
 
+    # Whether NULL values are sorted before non-NULL values by default (when
+    # NULLS FIRST/LAST is not specified) in ascending order, and after
+    # non-NULL values in descending order.  If false, NULL values are sorted
+    # after non-NULL values by default in ascending order, and before
+    # non-NULL values in descending order.
+    def sorts_nulls_first_by_default?
+      true
+    end
+
     # Whether common table expressions are supported in UNION/INTERSECT/EXCEPT clauses.
     def supports_cte_in_compounds?
       supports_cte_in_subqueries?
