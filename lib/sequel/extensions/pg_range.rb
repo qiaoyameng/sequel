@@ -18,6 +18,25 @@
 # In addition to the parser, this extension comes with literalizers
 # for PGRange and Range, so they can be used in queries and as bound variables.
 #
+# This extension also supports computing unions, intersections, and
+# differences of ranges locally, without a database connection:
+#
+#   r1.union(r2)         # => PGMultiRange
+#   r1.intersection(r2)  # => PGMultiRange
+#   r1.difference(r2)    # => PGMultiRange
+#
+# These methods are also available on PGMultiRange instances, accept
+# PGRange, PGMultiRange, and Range instances as arguments, and return
+# normalized PGMultiRange instances (from the pg_multirange extension,
+# which must be loaded) containing sorted, non-overlapping ranges.
+# Ranges over discrete domains (such as integers and dates) are
+# normalized to PostgreSQL's canonical [) form using a successor
+# function.  The successor function is chosen automatically for
+# Integer and Date endpoints, and can be provided explicitly for
+# other discrete domains via the :successor option:
+#
+#   r1.union(r2, :successor=>lambda{|v| v + 1})
+#
 # To turn an existing Range into a PGRange, use Sequel.pg_range:
 #
 #   Sequel.pg_range(range)
@@ -350,6 +369,30 @@ module Sequel
         true
       end
 
+      # Return the union of this range and the given range or multirange,
+      # as a normalized PGMultiRange (sorted, non-overlapping ranges).
+      # Requires the pg_multirange extension.  See SetOps.compute for
+      # supported options.
+      def union(other, opts=OPTS)
+        set_operation(:union, other, opts)
+      end
+
+      # Return the intersection of this range and the given range or
+      # multirange, as a normalized PGMultiRange (sorted, non-overlapping
+      # ranges).  Requires the pg_multirange extension.  See SetOps.compute
+      # for supported options.
+      def intersection(other, opts=OPTS)
+        set_operation(:intersection, other, opts)
+      end
+
+      # Return the difference of this range and the given range or
+      # multirange, as a normalized PGMultiRange (sorted, non-overlapping
+      # ranges).  Requires the pg_multirange extension.  See SetOps.compute
+      # for supported options.
+      def difference(other, opts=OPTS)
+        set_operation(:difference, other, opts)
+      end
+
       # Consider the receiver equal to other PGRange instances with the
       # same beginning, ending, exclusions, and database type.  Also consider
       # it equal to Range instances if this PGRange can be converted to a
@@ -500,6 +543,16 @@ module Sequel
 
       private
 
+      # Compute a set operation between this range and the given object,
+      # returning a normalized PGMultiRange.  Requires the pg_multirange
+      # extension, since the result is a PGMultiRange.
+      def set_operation(op, other, opts)
+        unless defined?(Sequel::Postgres::PGMultiRange)
+          raise Sequel::Error, "load the pg_multirange extension to compute range set operations"
+        end
+        SetOps.compute(op, self, other, opts)
+      end
+
       # Escape common range types.  Instead of quoting, just backslash escape all
       # special characters.
       def escape_value(k, ds)
@@ -523,6 +576,339 @@ module Sequel
         else
           ds.literal(k).gsub(/("|,|\\|\[|\]|\(|\))/, '\\\\\1')
         end
+      end
+    end
+
+    # SetOps implements offline set operations (union, intersection, and
+    # difference) on PGRange and PGMultiRange instances, without requiring
+    # a database connection.  All operations return normalized PGMultiRange
+    # instances (sorted, non-overlapping ranges), and do not modify their
+    # arguments.
+    #
+    # Internally, ranges are converted to intervals of the form
+    # [lower, lower_inclusive, upper, upper_inclusive], where a nil lower
+    # or upper represents an unbounded endpoint.  Ranges over discrete
+    # domains are first normalized to half-open [) intervals using a
+    # successor function, mirroring PostgreSQL's canonical form for
+    # discrete range types.
+    module PGRange::SetOps
+      # Successor functions used to normalize ranges over discrete domains
+      # to half-open intervals, by endpoint class.  Continuous domains
+      # (e.g. Float, BigDecimal, Time) have no successor and are handled
+      # using their inclusive/exclusive bounds directly.
+      DISCRETE_SUCCESSORS = {
+        Integer => lambda{|v| v + 1},
+        Date => lambda{|v| v + 1}
+      }.freeze
+
+      module_function
+
+      # Compute the given set operation (:union, :intersection, or
+      # :difference) between two PGRange/PGMultiRange/Range values,
+      # returning a normalized PGMultiRange.  Raises Sequel::Error if the
+      # database types of the arguments differ, or if their endpoints
+      # cannot be compared.  Options:
+      #
+      # :successor :: A callable returning the successor of a range
+      #               endpoint, used to normalize ranges over discrete
+      #               domains to PostgreSQL's canonical [) form.  By
+      #               default, Integer and Date endpoints use a successor
+      #               of +1, and other endpoints are treated as
+      #               continuous.
+      def compute(op, left, right, opts=OPTS)
+        left_ranges, left_type = ranges_and_type(left)
+        right_ranges, right_type = ranges_and_type(right)
+        db_type = compatible_db_type(left_type, right_type)
+        successor = discrete_successor(left_ranges, right_ranges, opts)
+
+        left_intervals = normalize_ranges(left_ranges, successor)
+        right_intervals = normalize_ranges(right_ranges, successor)
+
+        intervals = case op
+        when :union
+          merge_intervals(left_intervals + right_intervals)
+        when :intersection
+          intersect_intervals(left_intervals, right_intervals)
+        when :difference
+          difference_intervals(left_intervals, right_intervals)
+        else
+          raise Sequel::Error, "unsupported range set operation: #{op.inspect}"
+        end
+
+        build_multirange(intervals, db_type, successor)
+      end
+
+      # Extract an array of PGRange instances and the common database
+      # range type from the given object.
+      def ranges_and_type(obj)
+        case obj
+        when PGRange
+          [[obj], normalize_db_type(obj.db_type)]
+        when Range
+          [[PGRange.from_range(obj)], nil]
+        when PGMultiRange
+          ranges = obj.map{|r| to_pg_range(r)}
+          [ranges, uniform_db_type(ranges) || range_type_for_multirange(obj.db_type)]
+        when Array
+          ranges = obj.map{|r| to_pg_range(r)}
+          [ranges, uniform_db_type(ranges)]
+        else
+          raise Sequel::Error, "invalid argument for range set operation: #{obj.inspect}"
+        end
+      end
+
+      # Convert the object to a PGRange, raising for invalid objects.
+      def to_pg_range(obj)
+        case obj
+        when PGRange
+          obj
+        when Range
+          PGRange.from_range(obj)
+        else
+          raise Sequel::Error, "invalid range in range set operation: #{obj.inspect}"
+        end
+      end
+
+      # Return the database range type shared by all given ranges,
+      # raising if the ranges use different database types.
+      def uniform_db_type(ranges)
+        types = ranges.map{|r| normalize_db_type(r.db_type)}.compact.uniq
+        if types.length > 1
+          raise Sequel::Error, "cannot compute set operations on ranges with different database types: #{types.join(' and ')}"
+        end
+        types.first
+      end
+
+      # Normalize a database type to a string, treating nil and empty
+      # types as untyped.
+      def normalize_db_type(type)
+        if type
+          type = type.to_s
+          type unless type.empty?
+        end
+      end
+
+      # Derive the database range type for a multirange database type
+      # (e.g. 'int4multirange' => 'int4range').
+      def range_type_for_multirange(type)
+        if (type = normalize_db_type(type)) && type =~ /multirange\z/
+          type.sub(/multirange\z/, 'range')
+        end
+      end
+
+      # Derive the database multirange type for a database range type
+      # (e.g. 'int4range' => 'int4multirange').
+      def multirange_type_for_range(type)
+        type.sub(/(range)?\z/, 'multirange')
+      end
+
+      # Return the common database range type for the operation, raising
+      # if the arguments use different database types.
+      def compatible_db_type(left_type, right_type)
+        if left_type && right_type && left_type != right_type
+          raise Sequel::Error, "cannot compute set operations on ranges with different database types: #{left_type} and #{right_type}"
+        end
+        left_type || right_type
+      end
+
+      # Return the successor function to use for discrete normalization,
+      # or nil if the ranges should be treated as continuous.  If all
+      # endpoints are of a discrete class (Integer or Date), the
+      # successor for that class is used; any continuous endpoint makes
+      # the operation continuous.
+      def discrete_successor(left_ranges, right_ranges, opts)
+        return opts[:successor] if opts[:successor]
+
+        successor = nil
+        (left_ranges + right_ranges).each do |range|
+          next if range.empty?
+          [range.begin, range.end].each do |endpoint|
+            next if endpoint.nil?
+            if s = DISCRETE_SUCCESSORS[endpoint.class]
+              successor ||= s
+            else
+              return nil
+            end
+          end
+        end
+        successor
+      end
+
+      # Convert the ranges to a sorted, non-overlapping list of
+      # intervals, dropping empty ranges.  If a successor function is
+      # given, normalize to half-open [) intervals; otherwise, keep the
+      # inclusive/exclusive flags of the bounds.
+      def normalize_ranges(ranges, successor)
+        intervals = []
+        ranges.each do |range|
+          next if range.empty?
+          if successor
+            lower = range.begin
+            lower = successor.call(lower) if lower && range.exclude_begin?
+            upper = range.end
+            upper = successor.call(upper) if upper && !range.exclude_end?
+            next if lower && upper && compare_values(lower, upper) >= 0
+            intervals << [lower, true, upper, false]
+          else
+            lower = range.begin
+            upper = range.end
+            if lower && upper
+              cmp = compare_values(lower, upper)
+              next if cmp > 0 || (cmp == 0 && (range.exclude_begin? || range.exclude_end?))
+            end
+            intervals << [lower, !range.exclude_begin?, upper, !range.exclude_end?]
+          end
+        end
+        merge_intervals(intervals)
+      end
+
+      # Compare two endpoint values, raising if they are not comparable.
+      def compare_values(a, b)
+        cmp = begin
+          a <=> b
+        rescue StandardError
+          nil
+        end
+        unless cmp
+          raise Sequel::Error, "cannot compare range endpoints #{a.inspect} and #{b.inspect}"
+        end
+        cmp
+      end
+
+      # Compare two lower bounds, where a nil value is unbounded (smaller
+      # than any value), and for equal values an inclusive bound is
+      # smaller than an exclusive bound.
+      def compare_lowers(v1, i1, v2, i2)
+        return 0 if v1.nil? && v2.nil?
+        return -1 if v1.nil?
+        return 1 if v2.nil?
+        cmp = compare_values(v1, v2)
+        return cmp unless cmp == 0
+        i1 == i2 ? 0 : (i1 ? -1 : 1)
+      end
+
+      # Compare two upper bounds, where a nil value is unbounded (larger
+      # than any value), and for equal values an inclusive bound is
+      # larger than an exclusive bound.
+      def compare_uppers(v1, i1, v2, i2)
+        return 0 if v1.nil? && v2.nil?
+        return 1 if v1.nil?
+        return -1 if v2.nil?
+        cmp = compare_values(v1, v2)
+        return cmp unless cmp == 0
+        i1 == i2 ? 0 : (i1 ? 1 : -1)
+      end
+
+      # Sort the intervals by lower bound and merge overlapping or
+      # adjacent intervals, returning a sorted, non-overlapping list.
+      def merge_intervals(intervals)
+        merged = []
+        intervals.sort{|a, b| compare_lowers(a[0], a[1], b[0], b[1])}.each do |interval|
+          if merged.empty?
+            merged << interval
+          else
+            last = merged[-1]
+            if touches?(last, interval)
+              if compare_uppers(last[2], last[3], interval[2], interval[3]) < 0
+                last[2] = interval[2]
+                last[3] = interval[3]
+              end
+            else
+              merged << interval
+            end
+          end
+        end
+        merged
+      end
+
+      # Whether the upper bound of interval a touches or passes the lower
+      # bound of interval b, where a is sorted before b.
+      def touches?(a, b)
+        return true if a[2].nil? || b[0].nil?
+        cmp = compare_values(a[2], b[0])
+        cmp > 0 || (cmp == 0 && (a[3] || b[1]))
+      end
+
+      # Whether the interval contains at least one point.
+      def valid_interval?(interval)
+        lower, lower_inc, upper, upper_inc = interval
+        return true if lower.nil? || upper.nil?
+        cmp = compare_values(lower, upper)
+        cmp < 0 || (cmp == 0 && lower_inc && upper_inc)
+      end
+
+      # Compute the intersection of two sorted, non-overlapping interval
+      # lists.
+      def intersect_intervals(a_list, b_list)
+        intervals = []
+        i = j = 0
+        while i < a_list.length && j < b_list.length
+          a = a_list[i]
+          b = b_list[j]
+          lower = compare_lowers(a[0], a[1], b[0], b[1]) >= 0 ? a : b
+          upper_cmp = compare_uppers(a[2], a[3], b[2], b[3])
+          upper = upper_cmp <= 0 ? a : b
+          interval = [lower[0], lower[1], upper[2], upper[3]]
+          intervals << interval if valid_interval?(interval)
+          if upper_cmp < 0
+            i += 1
+          elsif upper_cmp > 0
+            j += 1
+          else
+            i += 1
+            j += 1
+          end
+        end
+        intervals
+      end
+
+      # Compute the difference of two sorted, non-overlapping interval
+      # lists (intervals in a_list but not in any interval in b_list).
+      def difference_intervals(a_list, b_list)
+        intervals = []
+        a_list.each do |a|
+          pieces = [a]
+          b_list.each do |b|
+            break if pieces.empty?
+            pieces = pieces.flat_map{|piece| subtract_interval(piece, b)}
+          end
+          intervals.concat(pieces)
+        end
+        intervals
+      end
+
+      # Subtract interval b from interval p, returning an array of zero,
+      # one, or two intervals.
+      def subtract_interval(p, b)
+        lower = compare_lowers(p[0], p[1], b[0], b[1]) >= 0 ? p : b
+        upper = compare_uppers(p[2], p[3], b[2], b[3]) <= 0 ? p : b
+        return [p] unless valid_interval?([lower[0], lower[1], upper[2], upper[3]])
+
+        pieces = []
+        unless b[0].nil?
+          left = [p[0], p[1], b[0], !b[1]]
+          pieces << left if valid_interval?(left)
+        end
+        unless b[2].nil?
+          right = [b[2], !b[3], p[2], p[3]]
+          pieces << right if valid_interval?(right)
+        end
+        pieces
+      end
+
+      # Build a normalized PGMultiRange from a sorted, non-overlapping
+      # interval list.  Intervals over discrete domains (normalized with
+      # a successor function) are returned in PostgreSQL's canonical [)
+      # form.
+      def build_multirange(intervals, db_type, successor)
+        ranges = intervals.map do |lower, lower_inc, upper, upper_inc|
+          if successor
+            PGRange.new(lower, upper, :exclude_begin=>lower.nil?, :exclude_end=>true, :db_type=>db_type)
+          else
+            PGRange.new(lower, upper, :exclude_begin=>lower.nil? ? true : !lower_inc, :exclude_end=>upper.nil? ? true : !upper_inc, :db_type=>db_type)
+          end
+        end
+        PGMultiRange.new(ranges, db_type && multirange_type_for_range(db_type))
       end
     end
   end

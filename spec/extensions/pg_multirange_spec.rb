@@ -370,8 +370,190 @@ describe "pg_multirange extension" do
       (@MR.new([], 'int4range') == @MR.new([], 'int8range')).must_equal false
       (@MR.new([], 'int4range') == []).must_equal true
       (@MR.new([], 'int4range').eql? @MR.new([], 'int4range')).must_equal true
-      (@MR.new([], 'int4range').eql? @MR.new([], 'int8range')).must_equal false
-      (@MR.new([], 'int4range').eql? []).must_equal true
+       (@MR.new([], 'int4range').eql? @MR.new([], 'int8range')).must_equal false
+       (@MR.new([], 'int4range').eql? []).must_equal true
+     end
+   end
+
+  describe "range set operations" do
+    it "should match set operations on finite integer sets for small ranges" do
+      domain = (0..6).to_a
+      ranges = []
+      [nil, 0, 2, 4, 6].each do |beg|
+        [nil, 0, 2, 4, 6].each do |en|
+          [false, true].each do |eb|
+            [false, true].each do |ee|
+              ranges << @R.new(beg, en, :exclude_begin=>eb, :exclude_end=>ee, :db_type=>'int4range')
+            end
+          end
+        end
+      end
+      ranges << @R.empty('int4range')
+
+      check_normalized = lambda do |mr|
+        prev = nil
+        mr.each do |r|
+          r.must_be_instance_of @R
+          r.db_type.must_equal 'int4range'
+          r.exclude_end?.must_equal true
+          r.exclude_begin?.must_equal r.begin.nil?
+          if prev
+            prev.end.wont_be_nil
+            r.begin.wont_be_nil
+            (prev.end < r.begin).must_equal true
+          end
+          prev = r
+        end
+      end
+
+      ranges.each do |a|
+        aset = domain.select{|i| a.cover?(i)}
+        ranges.each do |b|
+          bset = domain.select{|i| b.cover?(i)}
+          {:union=>(aset | bset).sort, :intersection=>(aset & bset).sort, :difference=>(aset - bset).sort}.each do |op, expected|
+            result = a.send(op, b)
+            result.instance_of?(@MR).must_equal true
+            result.db_type.must_equal 'int4multirange'
+            domain.select{|i| result.cover?(i)}.must_equal expected
+            check_normalized.call(result)
+          end
+        end
+      end
     end
+
+    it "should normalize discrete ranges to canonical [) form" do
+      @R.new(1, 5, :exclude_begin=>true, :db_type=>'int4range').union(
+        @R.new(6, 8, :exclude_end=>true, :db_type=>'int4range')).must_equal(
+        @MR.new([@R.new(2, 8, :exclude_end=>true, :db_type=>'int4range')], 'int4multirange'))
+
+      @R.new(Date.new(2020, 1, 1), Date.new(2020, 1, 3), :db_type=>'daterange').union(
+        @R.new(Date.new(2020, 1, 4), Date.new(2020, 1, 5), :db_type=>'daterange')).must_equal(
+        @MR.new([@R.new(Date.new(2020, 1, 1), Date.new(2020, 1, 6), :exclude_end=>true, :db_type=>'daterange')], 'datemultirange'))
+
+      # (1,2) is empty in a discrete domain
+      @R.new(1, 2, :exclude_begin=>true, :exclude_end=>true, :db_type=>'int4range').union(
+        @R.new(5, 6, :db_type=>'int4range')).must_equal(
+        @MR.new([@R.new(5, 7, :exclude_end=>true, :db_type=>'int4range')], 'int4multirange'))
+    end
+
+    it "should support an explicit :successor option for discrete normalization" do
+      @R.new('a', 'c').union(@R.new('c', 'e'), :successor=>lambda{|v| v.succ}).must_equal(
+        @MR.new([@R.new('a', 'f', :exclude_end=>true)], nil))
+      @R.new(1, 5).difference(@R.new(2, 4), :successor=>lambda{|v| v + 1}).must_equal(
+        @MR.new([@R.new(1, 2, :exclude_end=>true), @R.new(5, 6, :exclude_end=>true)], nil))
+    end
+    it "should compute continuous range operations using bound inclusiveness" do
+      # union merges when either side includes the shared boundary point
+      @R.new(1.0, 2.5).union(@R.new(2.5, 3.0, :exclude_begin=>true)).must_equal(
+        @MR.new([@R.new(1.0, 3.0)], nil))
+      @R.new(1.0, 2.5, :exclude_end=>true).union(@R.new(2.5, 3.0)).must_equal(
+        @MR.new([@R.new(1.0, 3.0)], nil))
+      # but not when both sides exclude it
+      @R.new(1.0, 2.5, :exclude_end=>true).union(@R.new(2.5, 3.0, :exclude_begin=>true)).must_equal(
+        @MR.new([@R.new(1.0, 2.5, :exclude_end=>true), @R.new(2.5, 3.0, :exclude_begin=>true)], nil))
+      # intersection at a single point
+      @R.new(1.0, 2.5).intersection(@R.new(2.5, 3.0)).must_equal(
+        @MR.new([@R.new(2.5, 2.5)], nil))
+      @R.new(1.0, 2.5, :exclude_end=>true).intersection(@R.new(2.5, 3.0)).must_equal @MR.new([], nil)
+      # difference splits a range into two, respecting boundary ownership
+      @R.new(1.0, 3.0).difference(@R.new(2.0, 2.5)).must_equal(
+        @MR.new([@R.new(1.0, 2.0, :exclude_end=>true), @R.new(2.5, 3.0, :exclude_begin=>true)], nil))
+      @R.new(1.0, 3.0).difference(@R.new(2.0, 2.5, :exclude_begin=>true, :exclude_end=>true)).must_equal(
+        @MR.new([@R.new(1.0, 2.0), @R.new(2.5, 3.0)], nil))
+      # BigDecimal endpoints are also continuous
+      @R.new(BigDecimal('1.5'), BigDecimal('2.5')).union(@R.new(BigDecimal('2.5'), BigDecimal('3.5'))).must_equal(
+        @MR.new([@R.new(BigDecimal('1.5'), BigDecimal('3.5'))], nil))
+    end
+
+    it "should handle unbounded range endpoints" do
+      unbounded = @R.new(nil, nil, :db_type=>'numrange')
+      unbounded.union(@R.new(1.0, 2.0, :db_type=>'numrange')).must_equal(
+        @MR.new([@R.new(nil, nil, :exclude_begin=>true, :exclude_end=>true, :db_type=>'numrange')], 'nummultirange'))
+      unbounded.difference(@R.new(1.0, 2.0, :db_type=>'numrange')).must_equal(
+        @MR.new([@R.new(nil, 1.0, :exclude_begin=>true, :exclude_end=>true, :db_type=>'numrange'),
+                 @R.new(2.0, nil, :exclude_begin=>true, :exclude_end=>true, :db_type=>'numrange')], 'nummultirange'))
+      @R.new(1.0, nil, :db_type=>'numrange').intersection(@R.new(nil, 2.0, :db_type=>'numrange')).must_equal(
+        @MR.new([@R.new(1.0, 2.0, :db_type=>'numrange')], 'nummultirange'))
+      @R.new(1.0, nil, :db_type=>'numrange').difference(@R.new(nil, 1.0, :db_type=>'numrange')).must_equal(
+        @MR.new([@R.new(1.0, nil, :exclude_begin=>true, :exclude_end=>true, :db_type=>'numrange')], 'nummultirange'))
+      @R.new(nil, 3.0, :exclude_end=>true).union(@R.new(3.0, nil)).must_equal(
+        @MR.new([@R.new(nil, nil, :exclude_begin=>true, :exclude_end=>true)], nil))
+      # discrete unbounded ranges use canonical [) form for bounded endpoints
+      @R.new(5, nil, :db_type=>'int4range').difference(@R.new(1, 10, :db_type=>'int4range')).must_equal(
+        @MR.new([@R.new(11, nil, :exclude_end=>true, :db_type=>'int4range')], 'int4multirange'))
+    end
+
+    it "should handle empty ranges and empty results" do
+      empty = @R.empty('int4range')
+      r = @R.new(1, 2, :db_type=>'int4range')
+      expected = @MR.new([@R.new(1, 3, :exclude_end=>true, :db_type=>'int4range')], 'int4multirange')
+      empty.union(r).must_equal expected
+      r.union(empty).must_equal expected
+      empty.union(empty).must_equal @MR.new([], 'int4multirange')
+      r.difference(r).must_equal @MR.new([], 'int4multirange')
+      empty.intersection(r).must_equal @MR.new([], 'int4multirange')
+      empty.difference(r).must_equal @MR.new([], 'int4multirange')
+      r.difference(r).db_type.must_equal 'int4multirange'
+    end
+
+    it "should raise errors for mixed database types or incomparable endpoints" do
+      proc{@R.new(1, 2, :db_type=>'int4range').union(@R.new(1, 2, :db_type=>'int8range'))}.must_raise Sequel::Error
+      proc{@R.new(1, 2, :db_type=>'int4range').union(@MR.new([@R.new(1, 2, :db_type=>'int8range')], 'int8multirange'))}.must_raise Sequel::Error
+      proc{@MR.new([@R.new(1, 2, :db_type=>'int4range')], 'int4multirange').union(@MR.new([@R.new(1, 2, :db_type=>'int8range')], 'int8multirange'))}.must_raise Sequel::Error
+      proc{@MR.new([@R.new(1, 2, :db_type=>'int4range'), @R.new(3, 4, :db_type=>'int8range')], 'int4multirange').union(@R.new(1, 2))}.must_raise Sequel::Error
+      proc{@R.new(1, 2).union(@R.new('a', 'b'))}.must_raise Sequel::Error
+      proc{@R.new(Date.new(2020, 1, 1), Date.new(2020, 1, 2)).union(@R.new(1, 2))}.must_raise Sequel::Error
+      proc{@R.new(1, 2).union(5)}.must_raise Sequel::Error
+    end
+
+    it "should not modify the arguments and should preserve db_type" do
+      r2 = @R.new(3, 8, :exclude_end=>true, :db_type=>'int4range')
+      mr = @MR.new([@R.new(1, 5, :exclude_end=>true, :db_type=>'int4range'), @R.new(10, 12, :exclude_end=>true, :db_type=>'int4range')], 'int4multirange')
+      snapshot = mr.map{|x| x}
+
+      result = mr.union(r2)
+      result.instance_of?(@MR).must_equal true
+      result.db_type.must_equal 'int4multirange'
+      result.all?{|r| r.db_type == 'int4range'}.must_equal true
+      result.must_equal @MR.new([@R.new(1, 8, :exclude_end=>true, :db_type=>'int4range'), @R.new(10, 12, :exclude_end=>true, :db_type=>'int4range')], 'int4multirange')
+
+      mr.map{|x| x}.must_equal snapshot
+      mr.db_type.must_equal 'int4multirange'
+      r2.must_equal @R.new(3, 8, :exclude_end=>true, :db_type=>'int4range')
+    end
+
+    it "should support Range and Array arguments" do
+      @R.new(1, 3, :db_type=>'int4range').union(4..6).must_equal(
+        @MR.new([@R.new(1, 7, :exclude_end=>true, :db_type=>'int4range')], 'int4multirange'))
+      @R.new(1, 6, :db_type=>'int4range').difference([@R.new(2, 3, :db_type=>'int4range'), 4..5]).must_equal(
+        @MR.new([@R.new(1, 2, :exclude_end=>true, :db_type=>'int4range'), @R.new(6, 7, :exclude_end=>true, :db_type=>'int4range')], 'int4multirange'))
+    end
+
+    it "should round trip set operation results through the parser and literalizer" do
+      cp = @db.conversion_procs
+      ds = @db.dataset
+      mr1 = cp[4451].call("{[1,3],(5,8)}")
+      mr2 = cp[4451].call("{[2,6)}")
+      {:union=>"{[1,8)}", :intersection=>"{[2,4)}", :difference=>"{[1,2), [6,8)}"}.each do |op, literal|
+        result = mr1.send(op, mr2)
+        result.unquoted_literal(ds).must_equal literal
+        cp[4451].call(result.unquoted_literal(ds)).must_equal result
+      end
+      @db.literal(mr1.union(mr2)).must_equal "int4multirange(int4range(1,8,'[)'))"
+      @db.literal(mr1.difference(mr2)).must_equal "int4multirange(int4range(1,2,'[)'), int4range(6,8,'[)'))"
+
+      # ranges parsed from the database
+      r = cp[3904].call("[1,5)").union(cp[3904].call("(4,8]"))
+      r.unquoted_literal(ds).must_equal "{[1,9)}"
+      cp[4451].call(r.unquoted_literal(ds)).must_equal r
+
+      # timestamp ranges are continuous
+      t1 = cp[4533].call("{[2011-01-02 10:20:30,2011-02-03 10:20:30)}")
+      t2 = cp[4533].call("{[2011-01-15 00:00:00,2011-01-20 00:00:00]}")
+      d = t1.difference(t2)
+      cp[4533].call(d.unquoted_literal(ds)).must_equal d
+      @db.literal(d).must_equal "tsmultirange(tsrange('2011-01-02 10:20:30','2011-01-15 00:00:00','[)'), tsrange('2011-01-20 00:00:00','2011-02-03 10:20:30','()'))"
+    end
+
   end
 end

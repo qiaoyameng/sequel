@@ -629,5 +629,19 @@ describe "pg_range extension" do
    it "should have #valid_ruby_range return #{startless_range_support} for startless, endless ranges" do
       @R.new(nil, nil).valid_ruby_range?.must_equal(startless_range_support)
     end
+
+    it "should raise an error for set operations if the pg_multirange extension is not loaded" do
+      if defined?(Sequel::Postgres::PGMultiRange)
+        mr = Sequel::Postgres.const_get(:PGMultiRange)
+        Sequel::Postgres.send(:remove_const, :PGMultiRange)
+      end
+      begin
+        proc{@R.new(1, 2).union(@R.new(2, 3))}.must_raise Sequel::Error
+        proc{@R.new(1, 2).intersection(@R.new(2, 3))}.must_raise Sequel::Error
+        proc{@R.new(1, 2).difference(@R.new(2, 3))}.must_raise Sequel::Error
+      ensure
+        Sequel::Postgres.const_set(:PGMultiRange, mr) if mr
+      end
+    end
   end
 end

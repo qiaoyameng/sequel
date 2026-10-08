@@ -12,6 +12,18 @@
 # In addition to the parser, this extension comes with literalizers
 # for PGMultiRanges, so they can be used in queries and as bound variables.
 #
+# This extension also supports computing unions, intersections, and
+# differences of multiranges locally, without a database connection:
+#
+#   mr1.union(mr2)         # => PGMultiRange
+#   mr1.intersection(mr2)  # => PGMultiRange
+#   mr1.difference(mr2)    # => PGMultiRange
+#
+# These methods are also available on PGRange instances, and return
+# normalized PGMultiRange instances containing sorted, non-overlapping
+# ranges.  See Sequel::Postgres::PGRange::SetOps.compute for details
+# and supported options.
+#
 # To turn an existing array of Ranges into a PGMultiRange, use Sequel.pg_multirange.
 # You must provide the type of multirange when creating the multirange:
 #
@@ -78,7 +90,9 @@ module Sequel
               when '}'
                 break
               when ','
-                # nothing
+                # Allow whitespace after the comma, so that the output of
+                # PGMultiRange#unquoted_literal round trips.
+                scan(/\s+/)
               else
                 raise Sequel::Error, "invalid multirange separator: #{sep.inspect}"
               end
@@ -265,7 +279,28 @@ module Sequel
       # Set the array of ranges to delegate to, and the database type.
       def initialize(ranges, db_type)
         super(ranges)
-        @db_type = db_type.to_s
+        @db_type = db_type.to_s if db_type
+      end
+
+      # Return the union of this multirange and the given range or
+      # multirange, as a normalized PGMultiRange (sorted, non-overlapping
+      # ranges).  See PGRange::SetOps.compute for supported options.
+      def union(other, opts=OPTS)
+        PGRange::SetOps.compute(:union, self, other, opts)
+      end
+
+      # Return the intersection of this multirange and the given range or
+      # multirange, as a normalized PGMultiRange (sorted, non-overlapping
+      # ranges).  See PGRange::SetOps.compute for supported options.
+      def intersection(other, opts=OPTS)
+        PGRange::SetOps.compute(:intersection, self, other, opts)
+      end
+
+      # Return the difference of this multirange and the given range or
+      # multirange, as a normalized PGMultiRange (sorted, non-overlapping
+      # ranges).  See PGRange::SetOps.compute for supported options.
+      def difference(other, opts=OPTS)
+        PGRange::SetOps.compute(:difference, self, other, opts)
       end
 
       # Append the multirange SQL to the given sql string. 
