@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 require_relative "spec_helper"
+require "set"
 
 describe "pg_multirange extension" do
   before(:all) do
@@ -285,6 +286,173 @@ describe "pg_multirange extension" do
   it "should return correct results for Database#schema_type_class" do
     @db.schema_type_class(:int4multirange).must_equal Sequel::Postgres::PGMultiRange
     @db.schema_type_class(:integer).must_equal Integer
+  end
+
+  describe "offline set operations" do
+    def int_range(beg, en, exclude_begin=false, exclude_end=false)
+      @R.new(beg, en, :exclude_begin=>exclude_begin, :exclude_end=>exclude_end, :db_type=>'int4range')
+    end
+
+    def num_range(beg, en, exclude_begin=false, exclude_end=false)
+      @R.new(beg, en, :exclude_begin=>exclude_begin, :exclude_end=>exclude_end, :db_type=>'numrange')
+    end
+
+    def integer_membership(range)
+      return Set.new if range.empty?
+      beg = range.begin || 0
+      en = range.end || 9
+      beg += 1 if range.exclude_begin?
+      en -= 1 if range.exclude_end?
+      beg <= en ? Set.new(beg..en) : Set.new
+    end
+
+    def multirange_membership(multirange)
+      membership = Set.new
+      multirange.to_a.each{|range| membership.merge(integer_membership(range))}
+      membership
+    end
+
+    it "should normalize unions, intersections, and differences against integer set membership" do
+      bounds = [nil, 0, 2, 5, 7, 9]
+      flags = [[false, false], [false, true], [true, false], [true, true]]
+      ranges = [@R.empty('int4range')]
+      bounds.each do |beg|
+        bounds.each do |en|
+          flags.each do |exclude_begin, exclude_end|
+            next if beg.nil?
+            next if en.nil?
+            ranges << int_range(beg, en, exclude_begin, exclude_end)
+          end
+        end
+      end
+
+      operations = [
+        [:union, lambda{|a, b| @MR.union(a, b)}, lambda{|a, b| a | b}],
+        [:intersection, lambda{|a, b| @MR.intersection(a, b)}, lambda{|a, b| a & b}],
+        [:difference, lambda{|a, b| @MR.difference(a, b)}, lambda{|a, b| a - b}],
+      ]
+
+      ranges.each do |a|
+        ranges.each do |b|
+          left = integer_membership(a)
+          right = integer_membership(b)
+          operations.each do |name, range_operation, set_operation|
+            result = range_operation.call(a, b)
+            multirange_membership(result).must_equal set_operation.call(left, right)
+            result.class.must_equal @MR
+            result.db_type.must_equal 'int4multirange'
+            result.each do |range|
+              range.db_type.must_equal 'int4range'
+              range.exclude_begin?.must_equal false
+              range.exclude_end?.must_equal true
+            end
+            result.to_a.each_cons(2) do |first, second|
+              first.end.must_be :<, second.begin
+            end
+          end
+        end
+      end
+    end
+
+    it "should handle empty and unbounded discrete ranges" do
+      @MR.union(@R.empty('int4range'), int_range(nil, 2)).must_equal @MR.new([int_range(nil, 3, false, true)], 'int4multirange')
+      @MR.intersection(@R.empty('int4range'), int_range(1, 2)).must_equal @MR.new([], 'int4multirange')
+      @MR.difference(int_range(nil, nil), int_range(3, 4, false, true)).must_equal @MR.new([
+        int_range(nil, 3, false, true),
+        int_range(4, nil, false, true),
+      ], 'int4multirange')
+    end
+
+    it "should preserve continuous boundary inclusion and not merge open adjacent ranges" do
+      @MR.union(num_range(1, 2, true, true), num_range(2, 3, false, true)).must_equal @MR.new([
+        num_range(1, 3, true, true)
+      ], 'nummultirange')
+
+      @MR.union(num_range(1, 2, true, true), num_range(2, 3, true, true)).must_equal @MR.new([
+        num_range(1, 2, true, true),
+        num_range(2, 3, true, true),
+      ], 'nummultirange')
+
+      @MR.intersection(num_range(1, 2, false, false), num_range(2, 3, false, false)).must_equal @MR.new([
+        num_range(2, 2, false, false)
+      ], 'nummultirange')
+
+      @MR.intersection(num_range(1, 2, false, true), num_range(2, 3, true, false)).must_be_empty
+
+      @MR.difference(num_range(1, 5, false, false), num_range(2, 3, false, true)).must_equal @MR.new([
+        num_range(1, 2, false, true),
+        num_range(3, 5, false, false),
+      ], 'nummultirange')
+    end
+
+    it "should group equivalent continuous endpoints according to the comparator" do
+      a = @R.new(BigDecimal('1'), BigDecimal('2'), :db_type=>'numrange')
+      b = @R.new(1, 3, :db_type=>'numrange')
+
+      @MR.intersection(a, b).must_equal @MR.new([
+        @R.new(BigDecimal('1'), BigDecimal('2'), :db_type=>'numrange')
+      ], 'nummultirange')
+      @MR.union(a, b).must_equal @MR.new([
+        @R.new(BigDecimal('1'), 3, :db_type=>'numrange')
+      ], 'nummultirange')
+    end
+
+    it "should split one continuous range into two without modifying the inputs or losing db_type" do
+      a = num_range(1, 5)
+      b = num_range(2, 3, false, true)
+      before = [a.inspect, b.inspect]
+      result = a.difference(b)
+
+      result.must_equal @MR.new([num_range(1, 2, false, true), num_range(3, 5)], 'nummultirange')
+      result.wont_include a
+      result.wont_include b
+      result.each{|range| range.db_type.must_equal 'numrange'}
+      [a.inspect, b.inspect].must_equal before
+    end
+
+    it "should normalize date ranges using an explicit successor" do
+      a = @R.new(Date.new(2020, 1, 1), Date.new(2020, 1, 2), :db_type=>'daterange')
+      b = @R.new(Date.new(2020, 1, 3), Date.new(2020, 1, 4), :exclude_end=>true, :db_type=>'daterange')
+
+      a.union(b).must_equal @MR.new([
+        @R.new(Date.new(2020, 1, 1), Date.new(2020, 1, 4), :exclude_end=>true, :db_type=>'daterange')
+      ], 'datemultirange')
+    end
+
+    it "should accept a successor for custom discrete domains" do
+      a = @R.new('a', 'b')
+      b = @R.new('c', 'd')
+      result = @MR.union(a, b, :successor=>:succ)
+
+      result.must_equal @MR.new([@R.new('a', 'e', :exclude_end=>true)], '')
+    end
+
+    it "should raise when database types are mixed" do
+      proc{int_range(1, 2).union(num_range(1, 2))}.must_raise Sequel::InvalidValue
+      proc{@MR.intersection(@MR.new([], 'int4multirange'), @MR.new([], 'nummultirange'))}.must_raise Sequel::InvalidValue
+    end
+
+    it "should raise when endpoint values cannot be compared" do
+      proc{@MR.union(int_range(1, 2), num_range('1', '2'))}.must_raise Sequel::InvalidValue
+    end
+
+    it "should support class methods, Ruby ranges, arrays, and nested arrays" do
+      @R.union(1..2, 3...5, :successor=>lambda{|v| v + 1}).must_equal @MR.new([
+        @R.new(1, 5, :exclude_end=>true)
+      ], '')
+
+      @MR.difference([int_range(1, 10)], [[int_range(3, 5, false, true)]]).must_equal @MR.new([
+        int_range(1, 3, false, true),
+        int_range(5, 11, false, true),
+      ], 'int4multirange')
+    end
+
+    it "should round trip normalized results through parsing and SQL literals" do
+      result = int_range(1, 2).union(int_range(4, 5, true, true))
+      parsed = @db.conversion_procs[4451].call(result.unquoted_literal(@db))
+      parsed.must_equal result
+      @db.literal(result).must_equal "int4multirange(int4range(1,3,'[)'))"
+    end
   end
 
   describe "parser" do
